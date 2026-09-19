@@ -12,6 +12,7 @@ import (
 
 	"github.com/valt-dev/valt/server/internal/agent"
 	"github.com/valt-dev/valt/server/internal/audit"
+	"github.com/valt-dev/valt/server/internal/dynsecret"
 	"github.com/valt-dev/valt/server/internal/vault"
 	"github.com/valt-dev/valt/server/pkg/crypto"
 )
@@ -22,18 +23,21 @@ type Server struct {
 	store     *Store
 	agentSvc  *agent.Service
 	vaultSvc  *vault.Service
+	dynSvc    *dynsecret.Service
 	auditLog  *audit.Logger
 	masterKey []byte
 	port      string
 	client    *http.Client
 }
 
-// NewServer creates a new gateway proxy Server.
-func NewServer(store *Store, agentSvc *agent.Service, vaultSvc *vault.Service, auditLog *audit.Logger, masterKey []byte, port string) *Server {
+// NewServer creates a new gateway proxy Server. dynSvc may be nil, which
+// disables derived-API-key authentication (all other behavior is unchanged).
+func NewServer(store *Store, agentSvc *agent.Service, vaultSvc *vault.Service, dynSvc *dynsecret.Service, auditLog *audit.Logger, masterKey []byte, port string) *Server {
 	return &Server{
 		store:     store,
 		agentSvc:  agentSvc,
 		vaultSvc:  vaultSvc,
+		dynSvc:    dynSvc,
 		auditLog:  auditLog,
 		masterKey: masterKey,
 		port:      port,
@@ -76,9 +80,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // handleHTTP processes regular HTTP requests through the proxy.
 // This is the main credential injection path.
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
-	// 1. Authenticate agent via Proxy-Authorization header
-	agentID, err := s.authenticateAgent(r)
-	if err != nil {
+	// 1. Authenticate: agent token (Proxy-Authorization) and/or a derived
+	// API key (Authorization, valt_dk_ prefix). A valid derived key on its
+	// own also authenticates — the lease carries the entitlement.
+	agentID, lease, authErr := s.authenticateRequest(r)
+	if authErr != nil {
 		http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
 		return
 	}
@@ -108,28 +114,40 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Find matching route — try placeholder scan first, then host+path
+	// 3. Find matching route — try placeholder scan first, then host+path.
+	// Skipped when a derived key authenticated the request: that lease
+	// already determines the credential, which is the provider's master key.
 	var route *ProxyRoute
-	placeholder := ScanForPlaceholder(r)
-	if placeholder != "" {
-		route, err = s.store.FindByPlaceholder(r.Context(), placeholder)
-		if err != nil {
-			log.Printf("gateway: placeholder lookup error: %v", err)
+	placeholder := ""
+	if lease == nil {
+		placeholder = ScanForPlaceholder(r)
+		if placeholder != "" {
+			route, err = s.store.FindByPlaceholder(r.Context(), placeholder)
+			if err != nil {
+				log.Printf("gateway: placeholder lookup error: %v", err)
+			}
+			// Verify the route belongs to this agent
+			if route != nil && route.AgentID != agentID {
+				route = nil
+			}
 		}
-		// Verify the route belongs to this agent
-		if route != nil && route.AgentID != agentID {
-			route = nil
-		}
-	}
-	if route == nil {
-		route, err = s.store.FindMatchingRoute(r.Context(), agentID, host, targetPath)
-		if err != nil {
-			log.Printf("gateway: route match error: %v", err)
+		if route == nil {
+			route, err = s.store.FindMatchingRoute(r.Context(), agentID, host, targetPath)
+			if err != nil {
+				log.Printf("gateway: route match error: %v", err)
+			}
 		}
 	}
 
-	// 4. Inject credential if route matched
-	if route != nil {
+	// 4. Inject credential: derived-key lease → the provider's master key;
+	// otherwise the route's secret value.
+	if lease != nil {
+		if injectErr := s.injectLeaseMasterKey(r, lease); injectErr != nil {
+			log.Printf("gateway: master key injection error for lease %s: %v", lease.ID, injectErr)
+			http.Error(w, "internal proxy error", http.StatusBadGateway)
+			return
+		}
+	} else if route != nil {
 		secretValue, decryptErr := s.decryptSecret(r.Context(), route.SecretID)
 		if decryptErr != nil {
 			log.Printf("gateway: decrypt error for secret %s: %v", route.SecretID, decryptErr)
@@ -191,7 +209,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 // handleConnect handles HTTPS CONNECT tunnel (no credential injection possible).
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
-	agentID, err := s.authenticateAgent(r)
+	agentID, _, err := s.authenticateRequest(r)
 	if err != nil {
 		http.Error(w, "Proxy Authentication Required", http.StatusProxyAuthRequired)
 		return
@@ -239,21 +257,121 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	go s.logProxyRequest(context.Background(), agentID, audit.ExtractIP(r), r.UserAgent(), host, "CONNECT", "")
 }
 
-// authenticateAgent extracts and validates the agent token from Proxy-Authorization.
-func (s *Server) authenticateAgent(r *http.Request) (string, error) {
+// authenticateRequest authenticates a proxied request and returns the agent
+// identity plus, when the request presented a Valt-derived API key, its lease.
+//
+// Accepted credentials (in order):
+//  1. Agent token in Proxy-Authorization, optionally combined with a derived
+//     key in Authorization — agent identity + lease entitlement, bound together.
+//  2. A derived key alone in Proxy-Authorization — the lease is the
+//     entitlement; its agent_id (if any) becomes the identity.
+func (s *Server) authenticateRequest(r *http.Request) (string, *dynsecret.LeaseInfo, error) {
+	agentID, tokenErr := s.validateAgentToken(r)
+	if tokenErr == nil {
+		if key := derivedKeyFromAuthorization(r); key != "" {
+			if s.dynSvc == nil {
+				return "", nil, fmt.Errorf("derived API keys are not enabled")
+			}
+			lease, err := derivedKeyAuth(r.Context(), s.dynSvc, key, agentID)
+			if err != nil {
+				logDerivedKeyError(agentID, err)
+				return "", nil, err
+			}
+			return agentID, lease, nil
+		}
+		return agentID, nil, nil
+	}
+
+	if key := bearerTokenFrom(r.Header.Get("Proxy-Authorization")); strings.HasPrefix(key, dynsecret.DerivedKeyPrefix) {
+		if s.dynSvc == nil {
+			return "", nil, fmt.Errorf("derived API keys are not enabled")
+		}
+		lease, err := derivedKeyAuth(r.Context(), s.dynSvc, key, "")
+		if err != nil {
+			logDerivedKeyError("", err)
+			return "", nil, err
+		}
+		id := ""
+		if lease.AgentID != nil {
+			id = *lease.AgentID
+		}
+		return id, lease, nil
+	}
+
+	return "", nil, tokenErr
+}
+
+// validateAgentToken validates the Proxy-Authorization bearer agent token
+// and returns the agent identity.
+func (s *Server) validateAgentToken(r *http.Request) (string, error) {
 	header := r.Header.Get("Proxy-Authorization")
 	if header == "" {
 		return "", fmt.Errorf("missing Proxy-Authorization")
 	}
-	parts := strings.SplitN(header, " ", 2)
-	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+	token := bearerTokenFrom(header)
+	if token == "" {
 		return "", fmt.Errorf("invalid Proxy-Authorization format")
 	}
-	token, err := s.agentSvc.ValidateToken(r.Context(), parts[1])
-	if err != nil || token == nil {
+	ident, err := s.agentSvc.ValidateToken(r.Context(), token)
+	if err != nil || ident == nil {
 		return "", fmt.Errorf("invalid agent token")
 	}
-	return token.AgentID, nil
+	return ident.AgentID, nil
+}
+
+// bearerTokenFrom extracts the token from a "Bearer <token>" header value.
+func bearerTokenFrom(header string) string {
+	parts := strings.SplitN(header, " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+		return ""
+	}
+	return strings.TrimSpace(parts[1])
+}
+
+// derivedKeyFromAuthorization returns the derived API key from the
+// Authorization header if one is present, otherwise "".
+func derivedKeyFromAuthorization(r *http.Request) string {
+	header := r.Header.Get("Authorization")
+	if strings.HasPrefix(header, "Bearer ") {
+		header = strings.TrimPrefix(header, "Bearer ")
+	}
+	header = strings.TrimSpace(header)
+	if strings.HasPrefix(header, dynsecret.DerivedKeyPrefix) {
+		return header
+	}
+	return ""
+}
+
+// injectLeaseMasterKey replaces the presented derived API key with the
+// provider's real master key, per the provider's injection config
+// (injection_type/injection_key, default bearer on Authorization).
+func (s *Server) injectLeaseMasterKey(r *http.Request, lease *dynsecret.LeaseInfo) error {
+	pc, err := s.dynSvc.GetProvider(r.Context(), lease.ProviderID)
+	if err != nil {
+		return fmt.Errorf("provider not found: %w", err)
+	}
+	masterKey := pc.Config["master_key"]
+	if masterKey == "" {
+		return fmt.Errorf("provider %s has no master_key configured", pc.ID)
+	}
+
+	route := &ProxyRoute{
+		InjectionType:   pc.Config["injection_type"],
+		InjectionKey:    pc.Config["injection_key"],
+		InjectionFormat: "{value}",
+	}
+	if route.InjectionKey == "" {
+		route.InjectionType = "bearer"
+	}
+
+	// The derived key never reaches the upstream API.
+	for _, h := range []string{"Authorization", "Proxy-Authorization"} {
+		if v := r.Header.Get(h); v != "" && strings.Contains(v, dynsecret.DerivedKeyPrefix) {
+			r.Header.Del(h)
+		}
+	}
+	InjectCredential(r, route, masterKey)
+	return nil
 }
 
 // decryptSecret retrieves and decrypts a secret value for credential injection.

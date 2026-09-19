@@ -3,16 +3,15 @@ package workflow
 import (
 	"context"
 	"fmt"
-	"io/fs"
 	"math/rand"
 	"os"
-	"sort"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/valt-dev/valt/server/internal/database"
+	"github.com/valt-dev/valt/server/internal/testutil"
 )
 
 func newWorkflowIntegrationDB(t *testing.T, ctx context.Context) (*pgxpool.Pool, func()) {
@@ -52,6 +51,7 @@ func newWorkflowIntegrationDB(t *testing.T, ctx context.Context) (*pgxpool.Pool,
 		adminPool.Close()
 		t.Fatalf("apply migrations failed: %v", err)
 	}
+	database.EnsurePartitions(ctx, pool)
 
 	cleanup := func() {
 		pool.Close()
@@ -62,30 +62,5 @@ func newWorkflowIntegrationDB(t *testing.T, ctx context.Context) (*pgxpool.Pool,
 }
 
 func applyWorkflowMigrations(ctx context.Context, pool *pgxpool.Pool) error {
-	entries, err := fs.ReadDir(database.MigrationsFS, "migrations")
-	if err != nil {
-		return fmt.Errorf("read migrations dir: %w", err)
-	}
-	upFiles := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if strings.HasSuffix(name, ".up.sql") {
-			upFiles = append(upFiles, name)
-		}
-	}
-	sort.Strings(upFiles)
-
-	for _, filename := range upFiles {
-		raw, err := fs.ReadFile(database.MigrationsFS, "migrations/"+filename)
-		if err != nil {
-			return fmt.Errorf("read migration %s: %w", filename, err)
-		}
-		if _, err := pool.Exec(ctx, string(raw)); err != nil {
-			return fmt.Errorf("exec migration %s: %w", filename, err)
-		}
-	}
-	return nil
+	return testutil.ApplyMigrations(ctx, pool)
 }

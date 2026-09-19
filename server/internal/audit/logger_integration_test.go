@@ -3,11 +3,8 @@ package audit
 import (
 	"context"
 	"fmt"
-	"io/fs"
 	"math/rand"
 	"os"
-	"sort"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/valt-dev/valt/server/internal/database"
+	"github.com/valt-dev/valt/server/internal/testutil"
 )
 
 // newAuditIntegrationDB provisions an isolated schema with all migrations
@@ -68,27 +66,7 @@ func newAuditIntegrationDB(t *testing.T, ctx context.Context) (*pgxpool.Pool, fu
 }
 
 func applyAuditMigrations(ctx context.Context, pool *pgxpool.Pool) error {
-	entries, err := fs.ReadDir(database.MigrationsFS, "migrations")
-	if err != nil {
-		return fmt.Errorf("read migrations dir: %w", err)
-	}
-	var upFiles []string
-	for _, entry := range entries {
-		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".up.sql") {
-			upFiles = append(upFiles, entry.Name())
-		}
-	}
-	sort.Strings(upFiles)
-	for _, filename := range upFiles {
-		raw, err := fs.ReadFile(database.MigrationsFS, "migrations/"+filename)
-		if err != nil {
-			return fmt.Errorf("read migration %s: %w", filename, err)
-		}
-		if _, err := pool.Exec(ctx, string(raw)); err != nil {
-			return fmt.Errorf("exec migration %s: %w", filename, err)
-		}
-	}
-	return nil
+	return testutil.ApplyMigrations(ctx, pool)
 }
 
 func fetchAllBySeq(ctx context.Context, t *testing.T, pool *pgxpool.Pool) []Entry {

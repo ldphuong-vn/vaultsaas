@@ -7,6 +7,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/valt-dev/valt/server/pkg/crypto"
@@ -108,6 +109,8 @@ func newProviderInstance(pc *ProviderConfig) (Provider, error) {
 	switch pc.ProviderType {
 	case "postgres":
 		return &PostgresProvider{config: *pc}, nil
+	case "derived_api_key":
+		return &DerivedKeyProvider{config: *pc}, nil
 	default:
 		return nil, fmt.Errorf("unknown provider type: %s", pc.ProviderType)
 	}
@@ -149,9 +152,9 @@ func (s *Service) CreateLease(ctx context.Context, providerID, agentID, requestI
 	}
 
 	err = s.db.QueryRow(ctx, `
-		INSERT INTO dynamic_leases (provider_id, agent_id, access_request_id, secret_data_enc, ttl_seconds, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-		providerID, agentIDPtr, reqIDPtr, encCreds, ttlSeconds, lease.ExpiresAt,
+		INSERT INTO dynamic_leases (provider_id, agent_id, access_request_id, secret_data_enc, key_hash, ttl_seconds, expires_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+		providerID, agentIDPtr, reqIDPtr, encCreds, lease.KeyHash, ttlSeconds, lease.ExpiresAt,
 	).Scan(&lease.ID)
 	if err != nil {
 		return nil, fmt.Errorf("insert lease: %w", err)
@@ -229,6 +232,74 @@ func (s *Service) GetLeaseProviderID(ctx context.Context, leaseID string) (strin
 	var providerID string
 	err := s.db.QueryRow(ctx, `SELECT provider_id FROM dynamic_leases WHERE id = $1`, leaseID).Scan(&providerID)
 	return providerID, err
+}
+
+// ValidateDerivedKey resolves a presented derived API key to its active lease.
+// Returns nil when the key is unknown, revoked, expired, or its provider was
+// disabled — callers must treat a nil lease as "access denied".
+func (s *Service) ValidateDerivedKey(ctx context.Context, rawKey string) (*LeaseInfo, error) {
+	if rawKey == "" {
+		return nil, nil
+	}
+	var li LeaseInfo
+	err := s.db.QueryRow(ctx, `
+		SELECT l.id, l.provider_id, l.agent_id, l.access_request_id, l.ttl_seconds, l.expires_at, l.revoked_at, l.created_at
+		FROM dynamic_leases l
+		JOIN dynamic_providers p ON p.id = l.provider_id AND p.status = 'active'
+		WHERE l.key_hash = $1`, hashDerivedKey(rawKey),
+	).Scan(&li.ID, &li.ProviderID, &li.AgentID, &li.AccessRequestID, &li.TTLSeconds, &li.ExpiresAt, &li.RevokedAt, &li.CreatedAt)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if li.RevokedAt != nil || time.Now().After(li.ExpiresAt) {
+		return nil, nil
+	}
+	return &li, nil
+}
+
+// GetActiveLease returns lease info only when the lease is still live
+// (exists, not revoked, not expired). nil otherwise.
+func (s *Service) GetActiveLease(ctx context.Context, leaseID string) (*LeaseInfo, error) {
+	var li LeaseInfo
+	err := s.db.QueryRow(ctx, `
+		SELECT id, provider_id, agent_id, access_request_id, ttl_seconds, expires_at, revoked_at, created_at
+		FROM dynamic_leases WHERE id = $1`, leaseID,
+	).Scan(&li.ID, &li.ProviderID, &li.AgentID, &li.AccessRequestID, &li.TTLSeconds, &li.ExpiresAt, &li.RevokedAt, &li.CreatedAt)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if li.RevokedAt != nil || time.Now().After(li.ExpiresAt) {
+		return nil, nil
+	}
+	return &li, nil
+}
+
+// GetLeaseCredentials decrypts and returns the credentials stored on a lease.
+func (s *Service) GetLeaseCredentials(ctx context.Context, leaseID string) (map[string]string, error) {
+	var credRaw []byte
+	err := s.db.QueryRow(ctx,
+		`SELECT secret_data_enc FROM dynamic_leases WHERE id = $1`, leaseID,
+	).Scan(&credRaw)
+	if err != nil {
+		return nil, fmt.Errorf("lease not found: %w", err)
+	}
+
+	var creds map[string]string
+	decCreds, decErr := crypto.DecryptAES256GCM(s.masterKey, credRaw)
+	if decErr != nil {
+		if jsonErr := json.Unmarshal(credRaw, &creds); jsonErr != nil {
+			return nil, fmt.Errorf("corrupted lease credentials")
+		}
+	} else if err := json.Unmarshal(decCreds, &creds); err != nil {
+		return nil, fmt.Errorf("parse lease credentials: %w", err)
+	}
+	return creds, nil
 }
 
 // StartExpiryWorker runs a background goroutine that marks expired leases every 60s.

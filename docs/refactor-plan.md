@@ -58,7 +58,7 @@ giữ migration DB nguyên (không phá dữ liệu người dùng cũ).
 |---|---|---|
 | ~~1–2~~ ✅ | ~~Fix hash-chain~~ (DONE 2026-09-04, xem §E) | test tái tạo bug 1, 2 → pass |
 | ~~3–4~~ ✅ | ~~Where-context + verify + export CSV~~ (DONE 2026-09-19, xem §F) | verify endpoint chạy được trên dữ liệu thật |
-| 5–8 | Provider "derived API key" + nối workflow approval → dynsecret lease | e2e: agent xin → duyệt → nhận lease TTL ngắn |
+| ~~5–8~~ ✅ | ~~Provider "derived API key" + nối workflow approval → dynsecret lease~~ (DONE 2026-09-19, xem §H) | e2e: agent xin → duyệt → nhận lease TTL ngắn (test integration 5 kịch bản pass) |
 | 9–10 | Revoke cascade (`POST /users/{id}/revoke-all`), `RemoveMember` org, sweeper DROP role | 1 lệnh làm chết mọi credential của 1 user |
 | 11–12 | Slack approval (từ notify → action), release pipeline MCP server + README mới, tag v1.0 | release có checksum 3 nền tảng |
 
@@ -69,11 +69,15 @@ giữ migration DB nguyên (không phá dữ liệu người dùng cũ).
 - [x] 2026-09-03: transfer repo → `ldphuong-vn/vaultsaas`; redirect URL cũ hoạt động.
 - [x] 2026-09-04: `git filter-repo` xóa binary khỏi lịch sử + force push
   (master + feat/custom-policy). Repo pack: ~50MB → 1.47MB.
-- [ ] Known pre-existing (không phải của đợt này): integration test
+- [x] Known pre-existing (không phải của đợt này): integration test
   `internal/workflow` fail khi chạy song song trên một DB chung — race
   `CREATE EXTENSION pgcrypto` giữa các schema, helper không gọi
   `database.EnsurePartitions`, và một test dựng Handler với notify store nil.
   Đã xác nhận fail giống hệt trên bản code trước fix hash-chain.
+  **[FIXED 2026-09-19, xem §H.6]** — helper migrate chung trong `internal/testutil`
+  bọc advisory lock; helper workflow gọi `EnsurePartitions`; test policy-e2e
+  không còn dựng Handler với notify store nil. Toàn bộ
+  `go test ./internal/... ./pkg/...` pass khi chạy song song.
 
 ## E. Nhật ký thực hiện — Fix hash-chain (2026-09-04)
 
@@ -161,3 +165,53 @@ diff) với mẫu ngẫu nhiên mỗi lần → chặn cả commit không dính 
 (chủ repo) đã chọn phương án xử lý: sửa hết finding có thể sửa của vaultsaas
 trước khi commit (mục ✅ phía trên); 2 mục acknowledged còn lại được chấp nhận
 rõ ràng, có lý do ghi ở đây.
+
+## H. Nhật ký thực hiện — Tuần 5–8: derived API key + nối approval → lease (2026-09-19)
+
+Deliverable của §C: e2e "agent xin → duyệt → nhận lease TTL ngắn". Migration
+000043 (`dynamic_provider_link`) gom 3 thay đổi schema của đợt này.
+
+1. **Provider `derived_api_key`** (`internal/dynsecret/derived_key.go`): config
+   giữ `master_key` (key AI API của công ty). `Create` trả
+   `valt_dk_<HMAC-SHA256(master_key, nonce 16B)>` — một chiều, không suy ra
+   được master key, và upstream thật không chấp nhận key này: nó chỉ có nghĩa
+   với Valt. Lease lưu `key_hash` (SHA256 hex) trong `dynamic_leases` để tra
+   O(1); raw key chỉ nằm trong `secret_data_enc` đã mã hóa. `Revoke`/`Renew`
+   là no-op phía backend — DB là nguồn chân lý (revoke = đánh dấu `revoked_at`).
+2. **Verify + tiêu thụ key dẫn xuất**:
+   - `Service.ValidateDerivedKey` — hash-lookup, trả nil khi key lạ/lease
+     hết hạn/revoke/provider bị disable.
+   - Gateway proxy xác thực được key dẫn xuất (`authenticateRequest`): agent
+     token (Proxy-Authorization) + key dẫn xuất (Authorization) đồng thời,
+     hoặc key dẫn xuất một mình. Lease cấp cho agent nào thì agent đó dùng
+     (binding check); khi tiêu thụ, gateway **hoán** key dẫn xuất thành
+     master key theo config `injection_type`/`injection_key` (mặc định bearer)
+     — key dẫn xuất không bao giờ tới upstream, master key không bao giờ tới
+     client.
+3. **Nối secret ↔ provider**: cột `secrets.dynamic_provider_id` +
+   `PUT/DELETE /secrets/{id}/dynamic-provider` (owner, hoặc member đủ quyền
+   write khi secret thuộc project). Provider phải active và cùng project.
+4. **Approval → lease** (`internal/workflow/lease.go`, `LeaseIssuer`): 4 điểm
+   phát credential (auto-approve, Approve, email action-token, ApproveBySystem)
+   đều đi qua một lỗ: secret có provider → mint lease TTL ngắn
+   `min(requested_duration, 3600s)` gắn `access_request_id`/`agent_id` thật;
+   session ghi `lease_id` để không phá luồng CLI/agent hiện có. **Fail
+   closed**: mint lỗi → không có credential nào được cấp, tuyệt đối không
+   fallback về giá trị tĩnh (chính là thứ provider này dùng để giữ lại).
+   Audit `lease.create` ghi approver (user_id UUID) hoặc NULL + `decided_via`
+   cho auto-approve. `GET /credentials/{request_id}` trả `credentials` của
+   lease (fail closed khi lease chết) — KHÔNG decrypt secret tĩnh;
+   `GET /credentials/active` cũng vậy ( vá luôn đường rò giá trị tĩnh qua
+   endpoint list). Revoke session → revoke lease (và ngược lại credential
+   chết ngay).
+5. **Test**: unit cho format key/HMAC/hash + gateway header parsing;
+   integration 5 kịch bản (`lease_issuer_integration_test.go`) trên Postgres
+   thật: e2e xin→duyệt→nhận key→verify→revoke; explicit approval; TTL cap;
+   fail-closed (không session nào tồn tại khi mint lỗi); static path không
+   đổi. Full suite 13 package pass (xem 6).
+6. **Fix luôn nợ kỹ thuật §D** (pre-existing): helper apply-migrations chung
+   `internal/testutil.ApplyMigrations` bọc `pg_advisory_lock` — hết race
+   `CREATE EXTENSION pgcrypto` khi chạy song song; helper workflow gọi
+   `EnsurePartitions`; test policy-e2e không còn dựng Handler với notify
+   store nil (truyền nil notifySvc — test đo policy, không đo notification).
+   `go test ./internal/... ./pkg/...` giờ pass khi chạy song song trên một DB.

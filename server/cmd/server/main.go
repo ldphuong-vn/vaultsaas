@@ -121,9 +121,14 @@ func main() {
 	vaultService := vault.NewService(pool, storage)
 	vaultHandler := vault.NewHandler(vaultService, masterKey)
 
+	dynSvc := dynsecret.NewService(pool, masterKey)
+	dynSvc.StartExpiryWorker(ctx)
+	dynHandler := dynsecret.NewHandler(dynSvc, pool)
+
 	workflowSvc := workflow.NewService(pool, cfg.PolicyEnforcementV2Enabled)
-	credMgr := workflow.NewCredentialManager(pool)
-	workflowHandler := workflow.NewHandler(workflowSvc, credMgr, vaultService, auditLogger, notifySvc, tokenStore, masterKey, pool)
+	credMgr := workflow.NewCredentialManager(pool, dynSvc)
+	leaseIssuer := workflow.NewLeaseIssuer(credMgr, dynSvc, auditLogger)
+	workflowHandler := workflow.NewHandler(workflowSvc, credMgr, leaseIssuer, vaultService, auditLogger, notifySvc, tokenStore, masterKey, pool)
 	slackWebhookHandler := notify.NewSlackWebhookHandler(cfg.SlackSigningSecret, workflowHandler, slackAdapter)
 	telegramWebhookHandler := notify.NewTelegramWebhookHandler(telegramAdapter, channelStore, pool, workflowHandler, cfg.TelegramBotUsername)
 
@@ -157,9 +162,6 @@ func main() {
 	policyHandler := policy.NewHandler(policySvc)
 	scannerSvc := scanner.NewService(pool)
 	scannerHandler := scanner.NewHandler(scannerSvc, pool)
-	dynSvc := dynsecret.NewService(pool, masterKey)
-	dynSvc.StartExpiryWorker(ctx)
-	dynHandler := dynsecret.NewHandler(dynSvc, pool)
 
 	// Redis rate limiter (optional — skip if REDIS_URL not set)
 	var agentRateLimiter *ratelimit.RedisLimiter
@@ -206,7 +208,7 @@ func main() {
 	gatewayStore := gateway.NewStore(pool)
 	gatewayHandler := gateway.NewHandler(gatewayStore)
 	if cfg.GatewayEnabled {
-		gw := gateway.NewServer(gatewayStore, agentSvc, vaultService, auditLogger, masterKey, cfg.GatewayPort)
+		gw := gateway.NewServer(gatewayStore, agentSvc, vaultService, dynSvc, auditLogger, masterKey, cfg.GatewayPort)
 		go func() {
 			if err := gw.ListenAndServe(ctx); err != nil && err != http.ErrServerClosed {
 				log.Printf("Gateway proxy failed: %v", err)

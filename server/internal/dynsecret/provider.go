@@ -38,6 +38,7 @@ type LeaseRequest struct {
 type Lease struct {
 	ID          string
 	Credentials map[string]string // e.g. {"username": "...", "password": "...", "host": "..."}
+	KeyHash     string            // lookup hash for verifiable credentials (derived API keys); empty for providers that provision real backends
 	ExpiresAt   time.Time
 	ProviderID  string
 }

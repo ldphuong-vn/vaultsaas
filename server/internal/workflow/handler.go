@@ -3,6 +3,7 @@ package workflow
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -22,27 +23,29 @@ import (
 
 // Handler serves workflow HTTP endpoints.
 type Handler struct {
-	service    *Service
-	credMgr    *CredentialManager
-	vaultSvc   *vault.Service
-	auditLog   *audit.Logger
-	notifySvc  *notify.Service
-	tokenStore *notify.ActionTokenStore
-	masterKey  []byte
-	pool       *pgxpool.Pool
+	service     *Service
+	credMgr     *CredentialManager
+	leaseIssuer *LeaseIssuer
+	vaultSvc    *vault.Service
+	auditLog    *audit.Logger
+	notifySvc   *notify.Service
+	tokenStore  *notify.ActionTokenStore
+	masterKey   []byte
+	pool        *pgxpool.Pool
 }
 
 // NewHandler creates a workflow Handler.
-func NewHandler(svc *Service, credMgr *CredentialManager, vaultSvc *vault.Service, auditLog *audit.Logger, notifySvc *notify.Service, tokenStore *notify.ActionTokenStore, masterKey []byte, pool *pgxpool.Pool) *Handler {
+func NewHandler(svc *Service, credMgr *CredentialManager, leaseIssuer *LeaseIssuer, vaultSvc *vault.Service, auditLog *audit.Logger, notifySvc *notify.Service, tokenStore *notify.ActionTokenStore, masterKey []byte, pool *pgxpool.Pool) *Handler {
 	return &Handler{
-		service:    svc,
-		credMgr:    credMgr,
-		vaultSvc:   vaultSvc,
-		auditLog:   auditLog,
-		notifySvc:  notifySvc,
-		tokenStore: tokenStore,
-		masterKey:  masterKey,
-		pool:       pool,
+		service:     svc,
+		credMgr:     credMgr,
+		leaseIssuer: leaseIssuer,
+		vaultSvc:    vaultSvc,
+		auditLog:    auditLog,
+		notifySvc:   notifySvc,
+		tokenStore:  tokenStore,
+		masterKey:   masterKey,
+		pool:        pool,
 	}
 }
 
@@ -185,8 +188,7 @@ func (h *Handler) CreateRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Auto-approve for Tier 1: issue credential immediately
 	if req.Status == "approved" {
-		_, issueErr := h.credMgr.IssueCredential(r.Context(), req.ID, secret.CredentialType, req.RequestedDurationMinutes)
-		if issueErr != nil {
+		if _, issueErr := h.leaseIssuer.IssueForRequest(r.Context(), req, secret); issueErr != nil {
 			log.Printf("Failed to auto-issue credential: %v", issueErr)
 		}
 	}
@@ -279,14 +281,10 @@ func (h *Handler) Approve(w http.ResponseWriter, r *http.Request) {
 		apierror.InternalError(w, "failed to issue credential")
 		return
 	}
-	credType := ""
-	if secret != nil {
-		credType = secret.CredentialType
-	}
 
-	// Issue credential
-	_, issueErr := h.credMgr.IssueCredential(r.Context(), req.ID, credType, req.RequestedDurationMinutes)
-	if issueErr != nil {
+	// Issue credential — a dynamic lease for provider-backed secrets, the
+	// static credential session otherwise. Fails closed: no lease, no credential.
+	if _, issueErr := h.leaseIssuer.IssueForRequest(r.Context(), req, secret); issueErr != nil {
 		log.Printf("Failed to issue credential after approval: %v", issueErr)
 		apierror.InternalError(w, "approved but failed to issue credential")
 		return
@@ -416,20 +414,36 @@ func (h *Handler) GetCredential(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Policy source for single-use enforcement below.
+	secret, err := h.vaultSvc.GetSecretByID(r.Context(), req.SecretID)
+	if err != nil {
+		log.Printf("Failed to fetch secret for credential delivery: %v", err)
+	}
+
 	callerDesc := userID
 	if agentID != "" {
 		callerDesc = "agent:" + agentID
 	}
 	h.auditLog.LogFromRequest(r, callerDesc, "credential.access", "credential_session", session.ID)
 
-	// Fetch secret by ID (no owner constraint — requester may not be owner)
-	secret, err := h.vaultSvc.GetSecretByID(r.Context(), req.SecretID)
-	if err != nil {
-		log.Printf("Failed to fetch secret for credential delivery: %v", err)
-	}
-
-	// Decrypt and attach value if secret has an encrypted DEK
-	if secret != nil && len(secret.EncryptedDEK) > 0 {
+	// Lease-backed session: deliver the lease credentials (fail closed when
+	// the lease is gone) and skip static-secret decryption entirely.
+	if session.LeaseID != nil {
+		creds, leaseErr := h.leaseIssuer.ResolveLeaseCredentials(r.Context(), session)
+		if leaseErr != nil {
+			if errors.Is(leaseErr, ErrLeaseInactive) {
+				apierror.NotFound(w, "lease expired or revoked")
+				return
+			}
+			log.Printf("Failed to resolve lease credentials for request %s: %v", requestID, leaseErr)
+			apierror.InternalError(w, "failed to resolve lease credentials")
+			return
+		}
+		session.Credentials = creds
+		if v, ok := creds["api_key"]; ok {
+			session.Value = v
+		}
+	} else if secret != nil && len(secret.EncryptedDEK) > 0 {
 		blob, blobErr := h.vaultSvc.GetBlob(r.Context(), secret.StorageKey)
 		if blobErr != nil {
 			log.Printf("Failed to get blob for credential delivery: %v", blobErr)
@@ -494,11 +508,9 @@ func (h *Handler) RedeemActionToken(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		secret, _ := h.vaultSvc.GetSecretByID(r.Context(), req.SecretID)
-		credType := ""
-		if secret != nil {
-			credType = secret.CredentialType
+		if _, issueErr := h.leaseIssuer.IssueForRequest(r.Context(), req, secret); issueErr != nil {
+			log.Printf("action-token approve: failed to issue credential: %v", issueErr)
 		}
-		_, _ = h.credMgr.IssueCredential(r.Context(), req.ID, credType, req.RequestedDurationMinutes)
 		h.auditLog.LogFromRequest(r, "email-action", "access_request.approve", "access_request", req.ID)
 	case "reject":
 		_, err := h.service.Reject(r.Context(), tok.RequestID, "email-action", "Rejected via email link")
@@ -515,11 +527,13 @@ func (h *Handler) RedeemActionToken(w http.ResponseWriter, r *http.Request) {
 
 // activeCredentialItem is the response shape for active credential listings.
 type activeCredentialItem struct {
-	RequestID  string `json:"request_id"`
-	SecretID   string `json:"secret_id"`
-	SecretName string `json:"secret_name"`
-	Value      string `json:"value"`
-	ExpiresAt  string `json:"expires_at"`
+	RequestID   string            `json:"request_id"`
+	SecretID    string            `json:"secret_id"`
+	SecretName  string            `json:"secret_name"`
+	Value       string            `json:"value"`
+	Credentials map[string]string `json:"credentials,omitempty"`
+	LeaseID     string            `json:"lease_id,omitempty"`
+	ExpiresAt   string            `json:"expires_at"`
 }
 
 // GetActiveCredentials handles GET /credentials/active?project_id=<id>
@@ -537,7 +551,7 @@ func (h *Handler) GetActiveCredentials(w http.ResponseWriter, r *http.Request) {
 	// Build query: find active sessions for this caller in the given project.
 	query := `
 		SELECT ar.id, ar.secret_id, s.name, cs.expires_at,
-		       s.encrypted_dek, s.storage_key
+		       cs.lease_id, s.encrypted_dek, s.storage_key
 		FROM credential_sessions cs
 		JOIN access_requests ar ON ar.id = cs.access_request_id
 		JOIN secrets s ON s.id = ar.secret_id
@@ -575,14 +589,36 @@ func (h *Handler) GetActiveCredentials(w http.ResponseWriter, r *http.Request) {
 		var item activeCredentialItem
 		var encDEK []byte
 		var storageKey string
+		var leaseID *string
 		var expiresAt interface{}
 		if err := rows.Scan(&item.RequestID, &item.SecretID, &item.SecretName,
-			&expiresAt, &encDEK, &storageKey); err != nil {
+			&expiresAt, &leaseID, &encDEK, &storageKey); err != nil {
 			log.Printf("GetActiveCredentials: scan error: %v", err)
 			continue
 		}
 		if t, ok := expiresAt.(interface{ String() string }); ok {
 			item.ExpiresAt = t.String()
+		}
+
+		// Lease-backed session: deliver lease credentials, never the static
+		// secret value stored on the secret row.
+		if leaseID != nil {
+			session := &CredentialSession{LeaseID: leaseID}
+			creds, leaseErr := h.leaseIssuer.ResolveLeaseCredentials(r.Context(), session)
+			if leaseErr != nil {
+				if errors.Is(leaseErr, ErrLeaseInactive) {
+					continue // lease already dead — session row will catch up
+				}
+				log.Printf("GetActiveCredentials: lease resolve error: %v", leaseErr)
+				continue
+			}
+			item.LeaseID = *leaseID
+			item.Credentials = creds
+			if v, ok := creds["api_key"]; ok {
+				item.Value = v
+			}
+			items = append(items, item)
+			continue
 		}
 
 		// Decrypt value if DEK present
@@ -617,12 +653,7 @@ func (h *Handler) ApproveBySystem(ctx context.Context, requestID, actor string) 
 		return err
 	}
 	secret, _ := h.vaultSvc.GetSecretByID(ctx, req.SecretID)
-	credType := ""
-	if secret != nil {
-		credType = secret.CredentialType
-	}
-	_, issueErr := h.credMgr.IssueCredential(ctx, req.ID, credType, req.RequestedDurationMinutes)
-	if issueErr != nil {
+	if _, issueErr := h.leaseIssuer.IssueForRequest(ctx, req, secret); issueErr != nil {
 		log.Printf("ApproveBySystem: failed to issue credential: %v", issueErr)
 	}
 	_, _ = h.auditLog.Log(ctx, audit.Entry{

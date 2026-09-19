@@ -8,24 +8,26 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/valt-dev/valt/server/internal/rbac"
 	"github.com/valt-dev/valt/server/pkg/crypto"
 )
 
 type Secret struct {
-	ID             string     `json:"id"`
-	UserID         string     `json:"user_id"`
-	ProjectID      *string    `json:"project_id,omitempty"`
-	Name           string     `json:"name"`
-	Description    string     `json:"description,omitempty"`
-	CredentialType string     `json:"credential_type"`
-	Source         string     `json:"source,omitempty"`
-	Version        int        `json:"version"`
-	StorageKey     string     `json:"-"`
-	EncryptedDEK   []byte     `json:"-"`
-	Policy         string     `json:"policy,omitempty"`
-	CreatedAt      time.Time  `json:"created_at"`
-	UpdatedAt      time.Time  `json:"updated_at"`
-	DeletedAt      *time.Time `json:"-"`
+	ID                string     `json:"id"`
+	UserID            string     `json:"user_id"`
+	ProjectID         *string    `json:"project_id,omitempty"`
+	Name              string     `json:"name"`
+	Description       string     `json:"description,omitempty"`
+	CredentialType    string     `json:"credential_type"`
+	Source            string     `json:"source,omitempty"`
+	Version           int        `json:"version"`
+	StorageKey        string     `json:"-"`
+	EncryptedDEK      []byte     `json:"-"`
+	DynamicProviderID *string    `json:"dynamic_provider_id,omitempty"` // set = approval mints a dynamic lease instead of returning the static value
+	Policy            string     `json:"policy,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+	DeletedAt         *time.Time `json:"-"`
 }
 
 type CreateSecretInput struct {
@@ -168,13 +170,15 @@ func (s *Service) GetSecret(ctx context.Context, userID, secretID string) (*Secr
 	var secret Secret
 	err := s.pool.QueryRow(ctx,
 		`SELECT id, user_id, name, description, storage_key, encrypted_dek,
-		        credential_type, source, version, policy, created_at, updated_at
+		        credential_type, source, version, policy, created_at, updated_at,
+		        project_id, dynamic_provider_id
 		 FROM secrets WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`,
 		secretID, userID,
 	).Scan(&secret.ID, &secret.UserID, &secret.Name, &secret.Description,
 		&secret.StorageKey, &secret.EncryptedDEK,
 		&secret.CredentialType, &secret.Source, &secret.Version,
-		&secret.Policy, &secret.CreatedAt, &secret.UpdatedAt)
+		&secret.Policy, &secret.CreatedAt, &secret.UpdatedAt,
+		&secret.ProjectID, &secret.DynamicProviderID)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, nil
@@ -237,14 +241,14 @@ func (s *Service) GetSecretByID(ctx context.Context, secretID string) (*Secret, 
 	err := s.pool.QueryRow(ctx,
 		`SELECT id, user_id, name, description, storage_key, encrypted_dek,
 		        credential_type, source, version, policy, created_at, updated_at,
-		        project_id
+		        project_id, dynamic_provider_id
 		 FROM secrets WHERE id = $1 AND deleted_at IS NULL`,
 		secretID,
 	).Scan(&secret.ID, &secret.UserID, &secret.Name, &secret.Description,
 		&secret.StorageKey, &secret.EncryptedDEK,
 		&secret.CredentialType, &secret.Source, &secret.Version,
 		&secret.Policy, &secret.CreatedAt, &secret.UpdatedAt,
-		&secret.ProjectID)
+		&secret.ProjectID, &secret.DynamicProviderID)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return nil, nil
@@ -252,6 +256,78 @@ func (s *Service) GetSecretByID(ctx context.Context, secretID string) (*Secret, 
 		return nil, fmt.Errorf("querying secret by id: %w", err)
 	}
 	return &secret, nil
+}
+
+// SetDynamicProvider links (providerID) or unlinks (nil) a dynamic provider to
+// a secret. When linked, approvals for this secret mint short-lived leases from
+// the provider instead of returning the static secret value.
+// Authorized callers: the secret owner, or a project member with secret write
+// permission when the secret lives in a project.
+func (s *Service) SetDynamicProvider(ctx context.Context, secretID, userID string, providerID *string) (*Secret, error) {
+	var ownerID string
+	var projectID *string
+	err := s.pool.QueryRow(ctx,
+		`SELECT user_id, project_id::text FROM secrets WHERE id = $1 AND deleted_at IS NULL`,
+		secretID,
+	).Scan(&ownerID, &projectID)
+	if err != nil {
+		return nil, fmt.Errorf("secret not found: %w", err)
+	}
+	if ownerID != userID {
+		authorized := false
+		if projectID != nil {
+			var role string
+			roleErr := s.pool.QueryRow(ctx,
+				`SELECT role FROM project_memberships WHERE project_id = $1 AND user_id = $2`,
+				*projectID, userID,
+			).Scan(&role)
+			if roleErr == nil {
+				authorized = rbac.Can(rbac.RoleFromProjectMembership(role), rbac.ResourceSecret, rbac.ActionWrite)
+			}
+		}
+		if !authorized {
+			return nil, fmt.Errorf("not authorized to modify this secret")
+		}
+	}
+
+	if providerID != nil {
+		var providerProjectID *string
+		var status string
+		err = s.pool.QueryRow(ctx,
+			`SELECT project_id::text, status FROM dynamic_providers WHERE id = $1`, *providerID,
+		).Scan(&providerProjectID, &status)
+		if err != nil {
+			return nil, fmt.Errorf("provider not found: %w", err)
+		}
+		if status != "active" {
+			return nil, fmt.Errorf("provider is not active")
+		}
+		// A lease provider lives in a project; the secret must belong to it.
+		if projectID == nil || providerProjectID == nil || *projectID != *providerProjectID {
+			return nil, fmt.Errorf("provider belongs to a different project than the secret")
+		}
+	}
+
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE secrets SET dynamic_provider_id = $2, updated_at = NOW()
+		 WHERE id = $1 AND deleted_at IS NULL`,
+		secretID, providerID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("updating secret provider link: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, fmt.Errorf("secret not found")
+	}
+
+	secret, err := s.GetSecretByID(ctx, secretID)
+	if err != nil {
+		return nil, err
+	}
+	if secret == nil {
+		return nil, fmt.Errorf("secret not found")
+	}
+	return secret, nil
 }
 
 // GetBlob retrieves the encrypted blob for a secret from object storage.
@@ -319,7 +395,7 @@ func (s *Service) ListSecretsForAgent(ctx context.Context, agentID string, page,
 	}
 
 	rows, err := s.pool.Query(ctx,
-		`SELECT DISTINCT s.id, s.user_id, s.name, s.description, s.credential_type, s.source, s.version, s.policy, s.created_at, s.updated_at
+		`SELECT DISTINCT s.id, s.user_id, s.name, s.description, s.credential_type, s.source, s.version, s.policy, s.created_at, s.updated_at, s.dynamic_provider_id
 		 FROM secrets s
 		 WHERE s.project_id IN (SELECT project_id FROM agent_identities WHERE id = $1)
 		 AND s.deleted_at IS NULL
@@ -336,7 +412,7 @@ func (s *Service) ListSecretsForAgent(ctx context.Context, agentID string, page,
 		var sec Secret
 		if err := rows.Scan(&sec.ID, &sec.UserID, &sec.Name, &sec.Description,
 			&sec.CredentialType, &sec.Source, &sec.Version,
-			&sec.Policy, &sec.CreatedAt, &sec.UpdatedAt); err != nil {
+			&sec.Policy, &sec.CreatedAt, &sec.UpdatedAt, &sec.DynamicProviderID); err != nil {
 			return nil, fmt.Errorf("scanning secret: %w", err)
 		}
 		secrets = append(secrets, sec)

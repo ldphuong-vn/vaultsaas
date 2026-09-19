@@ -14,7 +14,6 @@ import (
 
 	"github.com/valt-dev/valt/server/internal/audit"
 	"github.com/valt-dev/valt/server/internal/auth"
-	"github.com/valt-dev/valt/server/internal/notify"
 	"github.com/valt-dev/valt/server/internal/policy"
 	"github.com/valt-dev/valt/server/internal/vault"
 )
@@ -157,13 +156,14 @@ func bindPolicyToSecret(t *testing.T, ctx context.Context, pool *pgxpool.Pool) (
 
 func newCreateRequestTestHandler(pool *pgxpool.Pool, policyV2Enabled bool) *Handler {
 	vaultSvc := vault.NewService(pool, nil)
-	notifySvc := notify.NewService(nil, nil, "", nil, nil, nil, nil)
+	credMgr := NewCredentialManager(pool, nil)
 	return NewHandler(
 		NewService(pool, policyV2Enabled),
-		NewCredentialManager(pool),
+		credMgr,
+		NewLeaseIssuer(credMgr, nil, audit.NewLogger(pool)),
 		vaultSvc,
 		audit.NewLogger(pool),
-		notifySvc,
+		nil, // notifySvc: nil — these tests assert policy snapshots, not notifications
 		nil,
 		nil,
 		pool,

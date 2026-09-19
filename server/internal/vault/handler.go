@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
@@ -42,6 +43,8 @@ func (h *Handler) Routes() chi.Router {
 	r.Get("/{id}", h.GetSecret)
 	r.Put("/{id}", h.UpdateSecret)
 	r.Delete("/{id}", h.DeleteSecret)
+	r.Put("/{id}/dynamic-provider", h.SetDynamicProvider)
+	r.Delete("/{id}/dynamic-provider", h.SetDynamicProvider)
 	return r
 }
 
@@ -321,6 +324,60 @@ func (h *Handler) UpdateSecret(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(secret)
+}
+
+type setDynamicProviderRequest struct {
+	ProviderID *string `json:"provider_id"` // null/absent = unlink
+}
+
+// SetDynamicProvider handles PUT/DELETE /{id}/dynamic-provider.
+// PUT links a dynamic provider (body: {"provider_id": "..."}); DELETE unlinks.
+// Once linked, approvals for this secret mint short-lived leases from the
+// provider instead of returning the static secret value.
+func (h *Handler) SetDynamicProvider(w http.ResponseWriter, r *http.Request) {
+	userID := auth.UserIDFromContext(r.Context())
+	secretID := chi.URLParam(r, "id")
+
+	if _, err := validator.ValidateUUID(secretID); err != nil {
+		apierror.BadRequest(w, "invalid secret ID")
+		return
+	}
+
+	var providerID *string
+	if r.Method == http.MethodPut {
+		var req setDynamicProviderRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			apierror.BadRequest(w, "invalid request body")
+			return
+		}
+		if req.ProviderID == nil || *req.ProviderID == "" {
+			apierror.BadRequest(w, "provider_id is required")
+			return
+		}
+		if _, err := validator.ValidateUUID(*req.ProviderID); err != nil {
+			apierror.BadRequest(w, "invalid provider_id")
+			return
+		}
+		providerID = req.ProviderID
+	}
+
+	secret, err := h.service.SetDynamicProvider(r.Context(), secretID, userID, providerID)
+	if err != nil {
+		msg := err.Error()
+		switch {
+		case strings.Contains(msg, "not authorized"):
+			apierror.Forbidden(w, msg)
+		case strings.Contains(msg, "not found") || strings.Contains(msg, "different project") || strings.Contains(msg, "not active"):
+			apierror.BadRequest(w, msg)
+		default:
+			log.Printf("Failed to set dynamic provider for secret %s: %v", secretID, err)
+			apierror.InternalError(w, "failed to set dynamic provider")
+		}
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(secret) //nolint:errcheck
 }
 
 func (h *Handler) DeleteSecret(w http.ResponseWriter, r *http.Request) {
