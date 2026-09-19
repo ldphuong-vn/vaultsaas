@@ -2,15 +2,12 @@ package config
 
 import (
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
 
-// EnvLoader loads environment variables from .env file dynamically
-// without reading the file directly (uses system commands)
+// EnvLoader loads environment variables from a .env file.
 type EnvLoader struct {
 	projectRoot string
 	envVars     map[string]string
@@ -24,43 +21,13 @@ func NewEnvLoader(projectRoot string) *EnvLoader {
 	}
 }
 
-// LoadDynamically loads .env file using system commands (cat/powershell)
-// without direct file reading
+// LoadDynamically reads and parses the .env file.
 func (e *EnvLoader) LoadDynamically() error {
 	envPath := filepath.Join(e.projectRoot, ".env")
 
-	// Check if file exists first using system commands
-	if _, err := os.Stat(envPath); os.IsNotExist(err) {
-		return fmt.Errorf(".env file not found at %s", envPath)
-	}
-
-	// Use system cat/type command to read file content indirectly
-	var cmd *exec.Cmd
-	osName := os.Getenv("OS")
-
-	if strings.Contains(osName, "Windows") {
-		cmd = exec.Command("powershell", "-Command", fmt.Sprintf("Get-Content %q", envPath))
-	} else {
-		cmd = exec.Command("cat", envPath)
-	}
-
-	output, err := cmd.StdoutPipe()
+	data, err := os.ReadFile(envPath)
 	if err != nil {
-		return fmt.Errorf("failed to create stdout pipe: %w", err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("failed to start command: %w", err)
-	}
-
-	// Read output without direct file access
-	data, err := io.ReadAll(output)
-	if err != nil {
-		return fmt.Errorf("failed to read output: %w", err)
-	}
-
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("command execution failed: %w", err)
+		return fmt.Errorf(".env file not readable at %s: %w", envPath, err)
 	}
 
 	// Parse environment variables

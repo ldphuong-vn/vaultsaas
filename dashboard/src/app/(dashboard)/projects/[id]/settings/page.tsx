@@ -1,14 +1,20 @@
 import { notFound } from 'next/navigation'
 import { cookies } from 'next/headers'
 import { ProjectPolicySection } from '@/components/project-policy-section'
+import { backendUrl } from '@/lib/backend'
 import type { CustomPolicy } from '@/components/policy-editor'
 
 async function backendFetch<T>(path: string): Promise<T | null> {
   const cookieStore = await cookies()
   const token = cookieStore.get('valt_access_token')?.value
   if (!token) return null
-  const backend = process.env.BACKEND_URL ?? 'http://localhost:8080'
-  const res = await fetch(`${backend}/api/v1${path}`, {
+  let url: URL
+  try {
+    url = backendUrl(path)
+  } catch {
+    return null
+  }
+  const res = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },
     cache: 'no-store',
   })

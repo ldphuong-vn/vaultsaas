@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	neturl "net/url"
+
 	"github.com/spf13/cobra"
 	"github.com/valt-dev/valt/valt-cli/internal/api"
 	"github.com/valt-dev/valt/valt-cli/internal/config"
@@ -149,17 +151,23 @@ func pollForToken(client *api.Client, sessionID string) (string, error) {
 	return "", fmt.Errorf("login timed out after 3 minutes")
 }
 
-func openBrowser(url string) {
-	var cmdName string
+func openBrowser(rawURL string) {
+	// Only http(s) targets are ever opened; anything else is a caller bug.
+	u, err := neturl.Parse(rawURL)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") {
+		return
+	}
+	target := u.String()
 	switch runtime.GOOS {
 	case "windows":
-		cmdName = "start"
+		// "start" is a cmd builtin; rundll32 keeps the URL a single argv
+		// entry without involving a shell.
+		exec.Command("rundll32", "url.dll,FileProtocolHandler", target).Start() //nolint:errcheck
 	case "darwin":
-		cmdName = "open"
+		exec.Command("open", target).Start() //nolint:errcheck
 	default:
-		cmdName = "xdg-open"
+		exec.Command("xdg-open", target).Start() //nolint:errcheck
 	}
-	exec.Command(cmdName, url).Start() //nolint:errcheck
 }
 
 func parseChoice(s string, def int) int {

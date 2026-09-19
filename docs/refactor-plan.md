@@ -57,7 +57,7 @@ giữ migration DB nguyên (không phá dữ liệu người dùng cũ).
 | Tuần | Việc | Đầu ra đo được |
 |---|---|---|
 | ~~1–2~~ ✅ | ~~Fix hash-chain~~ (DONE 2026-09-04, xem §E) | test tái tạo bug 1, 2 → pass |
-| 3–4 | Where-context mọi call site + `GET /audit/verify` + export CSV | verify endpoint chạy được trên dữ liệu thật |
+| ~~3–4~~ ✅ | ~~Where-context + verify + export CSV~~ (DONE 2026-09-19, xem §F) | verify endpoint chạy được trên dữ liệu thật |
 | 5–8 | Provider "derived API key" + nối workflow approval → dynsecret lease | e2e: agent xin → duyệt → nhận lease TTL ngắn |
 | 9–10 | Revoke cascade (`POST /users/{id}/revoke-all`), `RemoveMember` org, sweeper DROP role | 1 lệnh làm chết mọi credential của 1 user |
 | 11–12 | Slack approval (từ notify → action), release pipeline MCP server + README mới, tag v1.0 | release có checksum 3 nền tảng |
@@ -108,3 +108,56 @@ chạy integration test thật.
    (sống qua restart — tái hiện bug 2; 8 goroutine × 5 log → seq 1..40 liền
    mạch, chuỗi valid; UPDATE thẳng DB → gãy đúng chỗ). Toàn bộ
    `go test ./internal/... ./pkg/...` pass (12 package).
+
+## F. Nhật ký thực hiện — Where-context + verify + export (2026-09-19)
+
+Tuần 3–4 của roadmap §C, trên nền hash-chain v2 đã fix ở §E.
+
+1. **Where-context đầy đủ** (trước đây chỉ 2 call site có IP):
+   - Gateway proxy (sự kiện audit quan trọng nhất — agent đi qua): `logProxyRequest`
+     giờ nhận IP + user-agent từ request của agent trước khi fire goroutine.
+   - `extractIP` → export thành `audit.ExtractIP`; consent handler bỏ bản copy
+     cục bộ, dùng chung.
+   - System actor (duyệt qua Slack/Telegram): metadata `{"via":"<actor>"}` ghi
+     rõ kênh ra quyết định (IP là của nền tảng chat nên không đưa vào ip_address
+     — trung thực hơn là misleading).
+   - **Seed chèn audit thẳng không có seq/hash → gãy chuỗi ngay từ dữ liệu mẫu**:
+     chuyển sang `Logger.AppendChainNoTx` trong tx của seed.
+2. **`GET /audit/verify`** (`verify.go` + handler): stream toàn bảng theo seq,
+   chain từng entry, dừng ở liên kết gãy đầu tiên. Trả về checked/head_seq/
+   head_hash/broken_seq/broken_id. **Tham số `?expected_head=<hash>`** — workflow
+   compliance thật: ghi head hash ra ngoài (email/biên bản) lúc audit, sau đó
+   verify ngược; head lệch = có row bị xóa ở đuôi (thứ bảng trong-table chain
+   không tự phát hiện được). Route chặn bằng admin middleware (dữ liệu chứa IP
+   của mọi user); `/logs` giữ quyền member như cũ.
+3. **`GET /audit/export.csv`**: stream CSV theo seq ASC, nhận cùng bộ filter
+   start/end/event_type như /logs, Content-Disposition attachment. Có guard
+   chống CSV formula injection (=, +, -, @, tab, CR ở đầu cell → thêm quote).
+4. **Test**: 4 integration mới cho VerifyFromDB (valid/empty/expected_head
+   match+mismatch/locate tampered row) + unit cho sanitizeCSVCell. Toàn bộ
+   audit suite 19 test pass; full build + go test pass.
+5. **Lính mới từ Mimosa scan**: sửa `internal/config/env_loader.go` — đọc
+   `.env` bằng `os.ReadFile` thay vì shell-out `powershell Get-Content`/`cat`
+   (command injection có thật, code vô lý có sẵn).
+
+## G. Security debt — triage Mimosa deep scan 2026-09-19 (12 findings)
+
+Kết quả scan toàn repo (`~/.mimosa/security-scans/...ed06f041ade5`). Không
+finding nào nằm ở các file thay đổi của đợt audit này. **Đã xử lý cùng ngày
+(xem cột trạng thái); chỉ còn 3 mục acknowledge-by-owner.**
+
+| Finding | Đánh giá | Trạng thái |
+|---|---|---|
+| Dashboard SSRF ×4 (`layout`, `secrets/[id]` ×2, `api/auth/refresh`, `api/proxy/[...path]`) | BFF fetch origin cố định từ env, path từ input | ✅ **Đã sửa**: helper chung `lib/backend.ts` — origin luôn từ `BACKEND_URL`, path segment validate (chặn `..`, `\`, CR/LF/NUL) + encode từng segment; 4 call site chuyển sang helper; tsc --noEmit pass |
+| `sdk/python/valt/__init__.py` SSRF | Client SDK fetch base_url từ config người dùng | ✅ **Đã sửa**: validate scheme http(s), resolve host và chặn private/loopback/link-local/reserved (opt-out `VALT_ALLOW_PRIVATE_NETWORKS=1` cho local dev), encode path segment |
+| `valt-cli/cmd/setup.go:162` command injection | `openBrowser` exec tên binary qua biến + URL chưa validate | ✅ **Đã sửa**: validate scheme http(s) trước, exec literal từng nhánh (`rundll32 url.dll,FileProtocolHandler` cho Windows — tránh builtin `start` qua shell) |
+| `test_e2e.sh` + `test_e2e_comprehensive.py` + `run_e2e_tests.sh` hardcoded credentials | Password test + URL production hardcode trong source | ✅ **Đã sửa**: đọc từ env (`VALT_E2E_PASSWORD` bắt buộc, `VALT_E2E_BASE_URL` mặc định localhost:8080); URL production cũ `valt.turbo.ai.vn` không còn default ở test script nào |
+| `mcp-server/src/scanner.rs` hardcoded credential | Regex detection patterns cho secret scanner (AKIA…, ghp_…) — dữ liệu sản phẩm, không phải credential | Acknowledged FP — won't-fix |
+| `server/cmd/valt/commands/run.go` + `valt-cli/cmd/run.go` command injection | **By design** — `valt run -- <cmd>` là executor cục bộ (mô hình `op run`), args tách rời không qua shell. Write-hook của Mimosa chặn cả ghi comment vào 2 file này | Acknowledged by-owner — won't-fix; nhắc lại trong `--help` khi chạm vào file lần tới (tuần 11–12 release pipeline) |
+| `SOC-SIEM-HIPAA`, `echeckin-proposal` path traversal | Khác dự án (hook quét cả workspace) | Ngoài phạm vi vaultsaas |
+
+Lưu ý quy trình: hook commit của Mimosa quét theo workspace (không phải theo
+diff) với mẫu ngẫu nhiên mỗi lần → chặn cả commit không dính finding. Anh
+(chủ repo) đã chọn phương án xử lý: sửa hết finding có thể sửa của vaultsaas
+trước khi commit (mục ✅ phía trên); 2 mục acknowledged còn lại được chấp nhận
+rõ ràng, có lý do ghi ở đây.

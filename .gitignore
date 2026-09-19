@@ -64,3 +64,6 @@ valt-cli/bin/
 repomix-output.xml
 dashboard/tsconfig.tsbuildinfo
 dashboard/*.tsbuildinfo
+
+# Mimosa security plugin runtime state
+.mimosa/

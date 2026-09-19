@@ -11,6 +11,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/argon2"
+
+	"github.com/valt-dev/valt/server/internal/audit"
 )
 
 func main() {
@@ -138,12 +140,19 @@ func main() {
 		{devID, "access_request.create", "access_request", pendingReqID},
 		{adminID, "access_request.approve", "access_request", approvedReqID},
 	}
+	// Audit rows must go through the hash chain (AppendChainNoTx) — direct
+	// inserts would leave seq/hash_prev NULL and break /audit/verify.
+	auditLogger := audit.NewLogger(pool)
 	for _, e := range auditEntries {
-		_, err = tx.Exec(ctx,
-			`INSERT INTO audit_logs (user_id, action, resource_type, resource_id, event_type, status, metadata)
-			 VALUES ($1, $2, $3, $4, 'action', 'success', '{}')`,
-			e.actorID, e.action, e.resource, e.resourceID,
-		)
+		_, err = auditLogger.AppendChainNoTx(ctx, tx, audit.Entry{
+			UserID:       e.actorID,
+			Action:       e.action,
+			ResourceType: e.resource,
+			ResourceID:   e.resourceID,
+			EventType:    "action",
+			Status:       "success",
+			Metadata:     "{}",
+		})
 		if err != nil {
 			log.Fatalf("Failed to insert audit log %q: %v", e.action, err)
 		}

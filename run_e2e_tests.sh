@@ -1,9 +1,11 @@
 #!/bin/bash
-BASE_URL="https://valt.turbo.ai.vn"
-TESTEMAIL="testrun$(date +%s)@valt.dev"
-TESTPASS="TestRun2026!"
-REGION_CODE="vn"
-TEST_EMAIL2="testrun2$(date +%s)@valt.dev"
+# Configuration comes from the environment — no credentials in source.
+BASE_URL=${VALT_E2E_BASE_URL:-http://localhost:8080}
+TESTEMAIL=testrun$(date +%s)@valt.dev
+: ${VALT_E2E_PASSWORD:?set VALT_E2E_PASSWORD to run e2e tests}
+TESTPASS=${VALT_E2E_PASSWORD}
+REGION_CODE=vn
+TEST_EMAIL2=testrun2$(date +%s)@valt.dev
 
 TOTAL=0
 PASSED=0

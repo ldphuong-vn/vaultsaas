@@ -212,3 +212,22 @@ func TestCanonicalIP(t *testing.T) {
 		}
 	}
 }
+
+func TestSanitizeCSVCell(t *testing.T) {
+	cases := map[string]string{
+		"":            "",
+		"normal":      "normal",
+		"=1+1":        "'=1+1",
+		"+SUM(A1)":    "'+SUM(A1)",
+		"-2":          "'-2",
+		"@cmd":        "'@cmd",
+		"\tTabbed":    "'\tTabbed",
+		"\rCR":        "'\rCR",
+		"safe-ish -1": "safe-ish -1", // dash not first char
+	}
+	for in, want := range cases {
+		if got := sanitizeCSVCell(in); got != want {
+			t.Errorf("sanitizeCSVCell(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

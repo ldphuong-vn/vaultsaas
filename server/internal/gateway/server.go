@@ -186,7 +186,7 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	if route != nil {
 		routeID = route.ID
 	}
-	go s.logProxyRequest(context.Background(), agentID, host, targetPath, routeID)
+	go s.logProxyRequest(context.Background(), agentID, audit.ExtractIP(r), r.UserAgent(), host, targetPath, routeID)
 }
 
 // handleConnect handles HTTPS CONNECT tunnel (no credential injection possible).
@@ -236,7 +236,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	go transfer(targetConn, clientConn)
 	go transfer(clientConn, targetConn)
 
-	go s.logProxyRequest(context.Background(), agentID, host, "CONNECT", "")
+	go s.logProxyRequest(context.Background(), agentID, audit.ExtractIP(r), r.UserAgent(), host, "CONNECT", "")
 }
 
 // authenticateAgent extracts and validates the agent token from Proxy-Authorization.
@@ -284,8 +284,10 @@ func (s *Server) decryptSecret(ctx context.Context, secretID string) (string, er
 	return string(plaintext), nil
 }
 
-// logProxyRequest writes an audit entry for a proxied request.
-func (s *Server) logProxyRequest(ctx context.Context, agentID, host, path, routeID string) {
+// logProxyRequest writes an audit entry for a proxied request. clientIP and
+// userAgent are captured from the inbound agent request before the goroutine
+// fires so the audit entry carries the full where-context.
+func (s *Server) logProxyRequest(ctx context.Context, agentID, clientIP, userAgent, host, path, routeID string) {
 	metadata := fmt.Sprintf(`{"host":"%s","path":"%s","route_id":"%s"}`, host, path, routeID)
 	if _, err := s.auditLog.Log(ctx, audit.Entry{
 		UserID:       agentID,
@@ -294,6 +296,8 @@ func (s *Server) logProxyRequest(ctx context.Context, agentID, host, path, route
 		ResourceID:   routeID,
 		EventType:    "action",
 		Status:       "success",
+		IPAddress:    clientIP,
+		UserAgent:    userAgent,
 		Metadata:     metadata,
 	}); err != nil {
 		log.Printf("gateway: audit log error: %v", err)

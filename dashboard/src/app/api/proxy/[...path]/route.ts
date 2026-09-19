@@ -1,10 +1,11 @@
 import { cookies } from 'next/headers'
 import { NextRequest, NextResponse } from 'next/server'
-
-const BACKEND = process.env.BACKEND_URL ?? 'http://localhost:8080'
+import { backendUrl } from '@/lib/backend'
 
 // Forward a request to the backend with the given access token.
 // Body is passed explicitly so it can be reused across retry attempts.
+// The catch-all path is user-controlled, so it goes through backendUrl's
+// segment validation — the target origin stays fixed at BACKEND_URL.
 async function forwardToBackend(
   req: NextRequest,
   path: string,
@@ -12,14 +13,22 @@ async function forwardToBackend(
   body: string | undefined,
 ): Promise<Response> {
   const url = new URL(req.url)
-  const backendUrl = `${BACKEND}/api/v1/${path}${url.search}`
+  let target: URL
+  try {
+    target = backendUrl(path, url.search)
+  } catch {
+    return new NextResponse(JSON.stringify({ error: 'Invalid path' }), {
+      status: 400,
+      headers: { 'Content-Type': 'application/json' },
+    })
+  }
 
   const headers: HeadersInit = {
     Authorization: `Bearer ${token}`,
     'Content-Type': 'application/json',
   }
 
-  return fetch(backendUrl, { method: req.method, headers, body })
+  return fetch(target, { method: req.method, headers, body })
 }
 
 // Attempt to refresh the access token using the refresh token cookie.
@@ -30,7 +39,7 @@ async function tryRefreshTokens(refreshToken: string): Promise<{
   expires_in: number
 } | null> {
   try {
-    const res = await fetch(`${BACKEND}/api/v1/auth/refresh`, {
+    const res = await fetch(backendUrl('/auth/refresh'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ refresh_token: refreshToken }),

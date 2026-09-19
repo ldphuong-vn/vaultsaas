@@ -1,8 +1,12 @@
 #!/bin/bash
-BASE_URL="https://valt.turbo.ai.vn"
-TEST_EMAIL="testrun-$(date +%s)@valt.dev"
-TEST_PASSWORD="TestRun2026!"
-REGION_CODE="vn"
+# Configuration comes from the environment — no credentials in source.
+#   VALT_E2E_BASE_URL    target deployment (default: local compose stack)
+#   VALT_E2E_PASSWORD    test password; the script aborts if unset
+BASE_URL=${VALT_E2E_BASE_URL:-http://localhost:8080}
+TEST_EMAIL=testrun-$(date +%s)@valt.dev
+: ${VALT_E2E_PASSWORD:?set VALT_E2E_PASSWORD to run e2e tests}
+TEST_PASSWORD=${VALT_E2E_PASSWORD}
+REGION_CODE=vn
 
 TOTAL=0
 PASSED=0

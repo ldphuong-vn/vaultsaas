@@ -630,6 +630,7 @@ func (h *Handler) ApproveBySystem(ctx context.Context, requestID, actor string) 
 		Action:       "access_request.approve",
 		ResourceType: "access_request",
 		ResourceID:   requestID,
+		Metadata:     fmt.Sprintf(`{"via":%q}`, actor),
 	})
 	return nil
 }
@@ -645,6 +646,7 @@ func (h *Handler) RejectBySystem(ctx context.Context, requestID, actor, reason s
 		Action:       "access_request.reject",
 		ResourceType: "access_request",
 		ResourceID:   requestID,
+		Metadata:     fmt.Sprintf(`{"via":%q}`, actor),
 	})
 	return nil
 }

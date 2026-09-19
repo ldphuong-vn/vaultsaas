@@ -119,7 +119,7 @@ func (l *Logger) LogFromRequest(r *http.Request, userID, action, resourceType, r
 		ResourceID:   resourceID,
 		EventType:    "action",
 		Status:       "success",
-		IPAddress:    extractIP(r),
+		IPAddress:    ExtractIP(r),
 		UserAgent:    r.UserAgent(),
 	}
 	if _, err := l.Log(r.Context(), e); err != nil {
@@ -179,7 +179,11 @@ func (l *Logger) AppendChainNoTx(ctx context.Context, tx pgx.Tx, e Entry) (Entry
 	return e, nil
 }
 
-func extractIP(r *http.Request) string {
+// ExtractIP returns the best client IP for an incoming request: the first
+// X-Forwarded-For entry, then X-Real-Ip, then the connection address without
+// its port. Raw header values may be lists or junk; Logger.Log canonicalizes
+// before persisting, so callers can pass the result straight through.
+func ExtractIP(r *http.Request) string {
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 		return xff
 	}

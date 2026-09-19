@@ -1,7 +1,6 @@
 import { cookies } from 'next/headers'
 import { NextResponse } from 'next/server'
-
-const BACKEND = process.env.BACKEND_URL ?? 'http://localhost:8080'
+import { backendUrl } from '@/lib/backend'
 
 // POST /api/auth/refresh
 // Reads valt_refresh_token cookie, calls backend refresh, sets new httpOnly cookies.
@@ -14,7 +13,7 @@ export async function POST() {
     return NextResponse.json({ error: 'No refresh token' }, { status: 401 })
   }
 
-  const backendRes = await fetch(`${BACKEND}/api/v1/auth/refresh`, {
+  const backendRes = await fetch(backendUrl('/auth/refresh'), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ refresh_token: refreshToken }),

@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
+"""E2E smoke tests. Configuration comes from the environment — no credentials
+in source: VALT_E2E_BASE_URL (default local compose stack) and
+VALT_E2E_PASSWORD (required)."""
+import os
 import subprocess
 import json
 import time
 
-BASE_URL = "https://valt.turbo.ai.vn"
+BASE_URL = os.environ.get("VALT_E2E_BASE_URL", "http://localhost:8080")
 TEST_EMAIL = f"testrun-{int(time.time())}@valt.dev"
-TEST_PASSWORD = "TestRun2026!"
+TEST_PASSWORD = os.environ["VALT_E2E_PASSWORD"]
 REGION_CODE = "vn"
 TEST_EMAIL_2 = f"testrun2-{int(time.time())}@valt.dev"
 

@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/valt-dev/valt/server/internal/audit"
 	"github.com/valt-dev/valt/server/internal/auth"
 	"github.com/valt-dev/valt/server/pkg/apierror"
 )
@@ -65,7 +66,7 @@ func (h *Handler) recordConsent(w http.ResponseWriter, r *http.Request) {
 		CredentialType: req.CredentialType,
 		ConsentType:    req.ConsentType,
 		Granted:        req.Granted,
-		IPAddress:      extractIP(r),
+		IPAddress:      audit.ExtractIP(r),
 		UserAgent:      r.UserAgent(),
 	}
 
@@ -80,18 +81,3 @@ func (h *Handler) recordConsent(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{"status": "recorded"})
 }
 
-func extractIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		return xff
-	}
-	if xri := r.Header.Get("X-Real-Ip"); xri != "" {
-		return xri
-	}
-	host := r.RemoteAddr
-	for i := len(host) - 1; i >= 0; i-- {
-		if host[i] == ':' {
-			return host[:i]
-		}
-	}
-	return host
-}

@@ -1,6 +1,7 @@
 import { notFound } from 'next/navigation'
 import { cookies } from 'next/headers'
 import { formatDate } from '@/lib/utils'
+import { backendUrl } from '@/lib/backend'
 import type { Secret, SecretPolicyBinding } from '@/types/api'
 import { Badge } from '@/components/ui/badge'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -12,8 +13,13 @@ async function backendFetch<T>(path: string): Promise<T | null> {
   const cookieStore = await cookies()
   const token = cookieStore.get('valt_access_token')?.value
   if (!token) return null
-  const backend = process.env.BACKEND_URL ?? 'http://localhost:8080'
-  const res = await fetch(`${backend}/api/v1${path}`, {
+  let url: URL
+  try {
+    url = backendUrl(path)
+  } catch {
+    return null
+  }
+  const res = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },
     cache: 'no-store',
   })
@@ -25,8 +31,13 @@ async function getPolicyBinding(id: string): Promise<SecretPolicyBinding | null>
   const cookieStore = await cookies()
   const token = cookieStore.get('valt_access_token')?.value
   if (!token) return null
-  const backend = process.env.BACKEND_URL ?? 'http://localhost:8080'
-  const res = await fetch(`${backend}/api/v1/secrets/${id}/policy-binding`, {
+  let url: URL
+  try {
+    url = backendUrl(`/secrets/${id}/policy-binding`)
+  } catch {
+    return null
+  }
+  const res = await fetch(url, {
     headers: { Authorization: `Bearer ${token}` },
     cache: 'no-store',
   })

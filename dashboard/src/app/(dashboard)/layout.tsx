@@ -1,16 +1,15 @@
 import { redirect } from 'next/navigation'
 import { headers, cookies } from 'next/headers'
 import { getSession } from '@/lib/auth'
+import { backendUrl } from '@/lib/backend'
 import Sidebar from '@/components/layout/sidebar'
 import Header from '@/components/layout/header'
-
-const BACKEND = process.env.BACKEND_URL ?? 'http://localhost:8080'
 
 // Check if the user has any organizations. Used to detect first-time users
 // whose auto-created org may have failed, so we redirect them to onboarding.
 async function userHasOrg(token: string): Promise<boolean> {
   try {
-    const res = await fetch(`${BACKEND}/api/v1/orgs`, {
+    const res = await fetch(backendUrl('/orgs'), {
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       // Short timeout via signal — don't block layout for too long.
       signal: AbortSignal.timeout(3000),
