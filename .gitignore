@@ -67,3 +67,7 @@ dashboard/*.tsbuildinfo
 
 # Mimosa security plugin runtime state
 .mimosa/
+
+# Python bytecode
+__pycache__/
+*.pyc
