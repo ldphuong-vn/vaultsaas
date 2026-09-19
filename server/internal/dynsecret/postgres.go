@@ -115,7 +115,9 @@ func (p *PostgresProvider) Create(ctx context.Context, req LeaseRequest) (*Lease
 	}, nil
 }
 
-// Revoke drops the temporary role.
+// Revoke drops the temporary role. The role carries privileges (CONNECT on
+// the database is granted at Create), and DROP ROLE refuses while objects
+// depend on it — so privileges are revoked first.
 func (p *PostgresProvider) Revoke(ctx context.Context, leaseID string) error {
 	// leaseID here is the username stored in credentials
 	if err := validateIdentifier(leaseID); err != nil {
@@ -126,6 +128,14 @@ func (p *PostgresProvider) Revoke(ctx context.Context, leaseID string) error {
 		return fmt.Errorf("postgres provider connect: %w", err)
 	}
 	defer conn.Close(ctx)
+
+	if db := p.config.Config["database"]; db != "" {
+		// Best-effort: the definitive gate is DROP ROLE below.
+		_, _ = conn.Exec(ctx, fmt.Sprintf(`REVOKE CONNECT ON DATABASE %s FROM %s`,
+			pgx.Identifier{db}.Sanitize(), pgx.Identifier{leaseID}.Sanitize()))
+		_, _ = conn.Exec(ctx, fmt.Sprintf(`DROP OWNED BY %s`,
+			pgx.Identifier{leaseID}.Sanitize()))
+	}
 	_, err = conn.Exec(ctx, fmt.Sprintf(`DROP ROLE IF EXISTS %s`, pgx.Identifier{leaseID}.Sanitize()))
 	return err
 }

@@ -59,7 +59,7 @@ giữ migration DB nguyên (không phá dữ liệu người dùng cũ).
 | ~~1–2~~ ✅ | ~~Fix hash-chain~~ (DONE 2026-09-04, xem §E) | test tái tạo bug 1, 2 → pass |
 | ~~3–4~~ ✅ | ~~Where-context + verify + export CSV~~ (DONE 2026-09-19, xem §F) | verify endpoint chạy được trên dữ liệu thật |
 | ~~5–8~~ ✅ | ~~Provider "derived API key" + nối workflow approval → dynsecret lease~~ (DONE 2026-09-19, xem §H) | e2e: agent xin → duyệt → nhận lease TTL ngắn (test integration 5 kịch bản pass) |
-| 9–10 | Revoke cascade (`POST /users/{id}/revoke-all`), `RemoveMember` org, sweeper DROP role | 1 lệnh làm chết mọi credential của 1 user |
+| ~~9–10~~ ✅ | ~~Revoke cascade (`POST /users/{id}/revoke-all`), `RemoveMember` org, sweeper DROP role~~ (DONE 2026-09-19, xem §I) | 1 lệnh làm chết mọi credential của 1 user |
 | 11–12 | Slack approval (từ notify → action), release pipeline MCP server + README mới, tag v1.0 | release có checksum 3 nền tảng |
 
 ## D. Việc nhà đã xong / còn treo
@@ -215,3 +215,51 @@ Deliverable của §C: e2e "agent xin → duyệt → nhận lease TTL ngắn". 
    `EnsurePartitions`; test policy-e2e không còn dựng Handler với notify
    store nil (truyền nil notifySvc — test đo policy, không đo notification).
    `go test ./internal/... ./pkg/...` giờ pass khi chạy song song trên một DB.
+
+## I. Nhật ký thực hiện — Tuần 9–10: revoke cascade + sweeper (2026-09-19)
+
+Deliverable của §C: "1 lệnh làm chết mọi credential của 1 user". Migration
+000044 (`lease_backend_sweep`) thêm `dynamic_leases.backend_swept_at` +
+partial index cho truy vấn sweeper.
+
+1. **`POST /users/{user_id}/revoke-all`** (`internal/workflow/revoke.go`,
+   `RevokeService`): ủy quyền = global admin (`users.role='admin'`) hoặc
+   chính chủ (trường hợp mất laptop). Cascade 4 bước, trả summary:
+   - **Leases** (`dynSvc.RevokeLeasesForUser`): mọi lease active mà
+     `access_request.requester_user_id` = user HOẶC `lease.agent_id` thuộc
+     agent `created_by` user. Lease postgres được DROP ROLE best-effort ngay
+     (sweeper là lưới dự phòng); key dẫn xuất chết theo `revoked_at`.
+   - **Credential sessions**: active session sinh từ request của user hoặc
+     session có `lease_id` thuộc lease của agent user — giết cả static lẫn
+     lease-backed.
+   - **Agent tokens + identities**: revoke `agent_tokens` trực tiếp
+     (phát hiện thật: `ValidateToken` KHÔNG kiểm tra
+     `agent_identities.status` — disable identity không đủ, token phải
+     revoked) rồi mới `status='disabled'` cho identity.
+   - **Access requests**: đánh dấu `'revoked'` cho request approved của user
+     và của agent user. Audit 1 entry `user.revoke_all` kèm summary JSON.
+   - Bug nhỏ sửa trong lúc test: `access_requests.ai_agent_id` là
+     VARCHAR(255) còn `agent_identities.id` là UUID → so sánh phải qua
+     `::text` (error `character varying = uuid` thật trên PG).
+2. **`RemoveMember` org** (`DELETE /orgs/{org_id}/members/{user_id}`): chỉ
+   org owner/admin được gọi (`callerIsAdminOrOwner` có sẵn); cấm xóa owner
+   (transfer ownership trước); xóa org membership + **cascade** xóa
+   project_memberships trong toàn bộ workspace của org — không để lại quyền
+   cấp project sống sót. Sentinel errors (`ErrRemoveOwner`,
+   `ErrMemberNotFound`, `ErrOrgNotFound`) map 400/404/403 rõ ràng.
+3. **Sweeper DROP role** (`internal/dynsecret/sweep.go`): expiry worker 60s
+   giờ chạy thêm `SweepExpiredBackends` — lease hết hạn quá grace 5 phút và
+   chưa swept → DROP backend credential rồi đánh dấu `backend_swept_at`.
+   Idempotent + resume được qua restart; DROP lỗi để NULL cho tick sau retry
+   (role không thể bị bỏ rơi âm thầm). Provider không có backend object
+   (derived key) chỉ đánh dấu.
+   **Bug thật bắt được nhờ test trên PG thật**: `DROP ROLE` fail
+   `2BP01` vì `GRANT CONNECT` lúc Create tạo dependency trên role. Sửa
+   `PostgresProvider.Revoke`: `REVOKE CONNECT` + `DROP OWNED BY` trước
+   `DROP ROLE` (best-effort, DROP ROLE là chốt).
+4. **Test**: sweeper integration 3 kịch bản trên instance thật (tạo role
+   thật → hết hạn → sweep → role biến mất trong `pg_roles`; derived chỉ
+   đánh dấu; grace window giữ nguyên); revoke-all e2e 2 user (target chết
+   toàn bộ 2 lease + 3 session + 2 token + 1 agent; control user giữ nguyên
+   toàn bộ); authz matrix HTTP 5 case (self/admin/other/unknown/anon);
+   RemoveMember cascade + guards. Full suite 14 package pass song song.

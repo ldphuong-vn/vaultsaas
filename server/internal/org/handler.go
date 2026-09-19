@@ -3,6 +3,7 @@ package org
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
 
@@ -41,6 +42,7 @@ func (h *Handler) Routes() chi.Router {
 	r.Put("/{org_id}", h.updateOrg)
 	r.Post("/{org_id}/members", h.addMember)
 	r.Get("/{org_id}/members", h.listMembers)
+	r.Delete("/{org_id}/members/{user_id}", h.removeMember)
 	r.Post("/{org_id}/invitations", h.createInvitation)
 	r.Get("/{org_id}/invitations", h.listInvitations)
 	r.Delete("/{org_id}/invitations/{invitation_id}", h.cancelInvitation)
@@ -179,6 +181,47 @@ func (h *Handler) addMember(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(m) //nolint:errcheck
+}
+
+// removeMember handles DELETE /orgs/{org_id}/members/{user_id}.
+// Only org owners/admins may remove members; the org owner cannot be removed.
+// The removed member's project memberships inside the org cascade away.
+func (h *Handler) removeMember(w http.ResponseWriter, r *http.Request) {
+	orgID := chi.URLParam(r, "org_id")
+	targetUserID := chi.URLParam(r, "user_id")
+	callerID := auth.UserIDFromContext(r.Context())
+
+	ok, err := callerIsAdminOrOwner(r.Context(), h.service, orgID, callerID)
+	if err != nil {
+		log.Printf("Failed to check org role for member removal: %v", err)
+		apierror.InternalError(w, "failed to remove member")
+		return
+	}
+	if !ok {
+		apierror.Forbidden(w, "org admin access required")
+		return
+	}
+
+	err = h.service.RemoveMember(r.Context(), orgID, targetUserID)
+	switch {
+	case err == nil:
+		// fall through to 204
+	case errors.Is(err, ErrOrgNotFound):
+		apierror.NotFound(w, "org not found")
+		return
+	case errors.Is(err, ErrRemoveOwner):
+		apierror.BadRequest(w, "cannot remove the org owner")
+		return
+	case errors.Is(err, ErrMemberNotFound):
+		apierror.NotFound(w, "member not found")
+		return
+	default:
+		log.Printf("Failed to remove org member: %v", err)
+		apierror.InternalError(w, "failed to remove member")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) listMembers(w http.ResponseWriter, r *http.Request) {

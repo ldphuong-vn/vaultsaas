@@ -302,7 +302,9 @@ func (s *Service) GetLeaseCredentials(ctx context.Context, leaseID string) (map[
 	return creds, nil
 }
 
-// StartExpiryWorker runs a background goroutine that marks expired leases every 60s.
+// StartExpiryWorker runs a background goroutine that every 60s marks expired
+// leases revoked and sweeps backend credentials (e.g. drops leftover Postgres
+// temp roles) for leases that expired a while ago.
 func (s *Service) StartExpiryWorker(ctx context.Context) {
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
@@ -312,9 +314,78 @@ func (s *Service) StartExpiryWorker(ctx context.Context) {
 			case <-ticker.C:
 				_, _ = s.db.Exec(ctx,
 					`UPDATE dynamic_leases SET revoked_at = now() WHERE expires_at < now() AND revoked_at IS NULL`)
+				if swept, err := s.SweepExpiredBackends(ctx); err != nil {
+					log.Printf("dynsecret sweeper: %v", err)
+				} else if swept > 0 {
+					log.Printf("dynsecret sweeper: cleaned up %d expired lease backends", swept)
+				}
 			case <-ctx.Done():
 				return
 			}
 		}
 	}()
+}
+
+// RevokeLeasesForUser revokes every active lease belonging to a user: leases
+// minted from the user's own access requests, and leases bound to agents the
+// user created. Postgres backend roles are dropped best-effort immediately —
+// the sweeper stays as the fallback for anything that fails. Returns the
+// number of leases revoked. Part of the week 9-10 revoke cascade.
+func (s *Service) RevokeLeasesForUser(ctx context.Context, userID string) (int, error) {
+	rows, err := s.db.Query(ctx, `
+		SELECT l.id, l.secret_data_enc, p.provider_type, p.config_enc
+		FROM dynamic_leases l
+		JOIN dynamic_providers p ON p.id = l.provider_id
+		WHERE l.revoked_at IS NULL
+		  AND (
+		    l.access_request_id IN (SELECT id FROM access_requests WHERE requester_user_id = $1)
+		    OR l.agent_id IN (SELECT id FROM agent_identities WHERE created_by = $1)
+		  )`, userID)
+	if err != nil {
+		return 0, fmt.Errorf("querying leases for user: %w", err)
+	}
+	defer rows.Close()
+
+	type leaseRef struct {
+		id           string
+		credRaw      []byte
+		providerType string
+		provCfgRaw   []byte
+	}
+	var refs []leaseRef
+	for rows.Next() {
+		var r leaseRef
+		if err := rows.Scan(&r.id, &r.credRaw, &r.providerType, &r.provCfgRaw); err != nil {
+			return 0, err
+		}
+		refs = append(refs, r)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
+	revoked := 0
+	for _, r := range refs {
+		if _, err := s.db.Exec(ctx,
+			`UPDATE dynamic_leases SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL`, r.id); err != nil {
+			return revoked, fmt.Errorf("revoke lease %s: %w", r.id, err)
+		}
+		revoked++
+
+		// Best-effort immediate backend cut; the sweeper retries later.
+		if r.providerType == "postgres" {
+			if creds, credErr := s.decryptCreds(r.credRaw); credErr == nil {
+				if username, ok := creds["username"]; ok && username != "" {
+					if prov, provErr := s.providerFor(r.providerType, r.provCfgRaw); provErr == nil {
+						if err := prov.Revoke(ctx, username); err != nil {
+							log.Printf("dynsecret revoke-all: drop role %q for lease %s: %v", username, r.id, err)
+						}
+					}
+				}
+			} else {
+				log.Printf("dynsecret revoke-all: decrypt lease %s: %v", r.id, credErr)
+			}
+		}
+	}
+	return revoked, nil
 }

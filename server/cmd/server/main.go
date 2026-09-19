@@ -129,6 +129,7 @@ func main() {
 	credMgr := workflow.NewCredentialManager(pool, dynSvc)
 	leaseIssuer := workflow.NewLeaseIssuer(credMgr, dynSvc, auditLogger)
 	workflowHandler := workflow.NewHandler(workflowSvc, credMgr, leaseIssuer, vaultService, auditLogger, notifySvc, tokenStore, masterKey, pool)
+	revokeSvc := workflow.NewRevokeService(pool, dynSvc, credMgr, auditLogger)
 	slackWebhookHandler := notify.NewSlackWebhookHandler(cfg.SlackSigningSecret, workflowHandler, slackAdapter)
 	telegramWebhookHandler := notify.NewTelegramWebhookHandler(telegramAdapter, channelStore, pool, workflowHandler, cfg.TelegramBotUsername)
 
@@ -340,6 +341,10 @@ func main() {
 			r.Get("/access-requests", workflowHandler.ListPending)
 			r.Post("/access-requests/{request_id}/approve", workflowHandler.Approve)
 			r.Post("/access-requests/{request_id}/reject", workflowHandler.Reject)
+
+			// Revoke cascade — admin (or the user themselves) kills every
+			// credential granted to a user: leases, sessions, agent tokens.
+			r.Post("/users/{user_id}/revoke-all", revokeSvc.HandleRevokeAllForUser)
 
 			// Audit and user-specific operations
 			r.Mount("/audit", auditHandler.Routes())

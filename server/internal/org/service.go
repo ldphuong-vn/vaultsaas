@@ -2,11 +2,19 @@ package org
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// Sentinel errors for member removal, mapped to HTTP statuses by the handler.
+var (
+	ErrOrgNotFound    = errors.New("org not found")
+	ErrRemoveOwner    = errors.New("cannot remove the org owner")
+	ErrMemberNotFound = errors.New("member not found")
 )
 
 type Org struct {
@@ -135,9 +143,42 @@ func (s *Service) AddMember(ctx context.Context, orgID, userID, role string) (*M
 	return &m, nil
 }
 
+// RemoveMember removes a member from an org and cascades: their project
+// memberships inside the org's workspaces are removed too, so no lingering
+// project-level access survives. The org owner cannot be removed (transfer
+// ownership first). Revoking the ex-member's issued credentials, if wanted,
+// is a separate call: POST /users/{id}/revoke-all.
+func (s *Service) RemoveMember(ctx context.Context, orgID, userID string) error {
+	var ownerID string
+	err := s.pool.QueryRow(ctx,
+		`SELECT owner_id FROM organizations WHERE id = $1`, orgID,
+	).Scan(&ownerID)
+	if err != nil {
+		return ErrOrgNotFound
+	}
+	if ownerID == userID {
+		return ErrRemoveOwner
+	}
+
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM org_memberships WHERE org_id = $1 AND user_id = $2`, orgID, userID)
+	if err != nil {
+		return fmt.Errorf("removing member: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrMemberNotFound
+	}
+
+	_, _ = s.pool.Exec(ctx, `
+		DELETE FROM project_memberships pm
+		USING projects p
+		JOIN workspaces w ON w.id = p.workspace_id
+		WHERE pm.project_id = p.id AND w.org_id = $1 AND pm.user_id = $2`, orgID, userID)
+	return nil
+}
+
 // ListMembers returns all members of an org.
-func (s *Service) ListMembers(ctx context.Context, orgID string) ([]Member, error) {
-	rows, err := s.pool.Query(ctx,
+func (s *Service) ListMembers(ctx context.Context, orgID string) ([]Member, error) {	rows, err := s.pool.Query(ctx,
 		`SELECT org_id, user_id, role, created_at
 		 FROM org_memberships WHERE org_id = $1
 		 ORDER BY created_at ASC`,
