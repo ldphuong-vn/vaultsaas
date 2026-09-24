@@ -2,6 +2,7 @@ package dynsecret
 
 import (
 	"context"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -14,6 +15,23 @@ import (
 	"github.com/valt-dev/valt/server/internal/testutil"
 	"github.com/valt-dev/valt/server/pkg/crypto"
 )
+
+// newSweepMasterKey generates a fresh AES-256 key per test run — integration
+// tests must not embed key material as source literals.
+func newSweepMasterKey(t *testing.T) []byte {
+	t.Helper()
+	k := make([]byte, 32)
+	if _, err := cryptorand.Read(k); err != nil {
+		t.Fatalf("generate master key: %v", err)
+	}
+	return k
+}
+
+// newSweepDerivedMaster returns a random string for derived_api_key configs.
+func newSweepDerivedMaster(t *testing.T) string {
+	t.Helper()
+	return fmt.Sprintf("sk-test-%d", time.Now().UnixNano())
+}
 
 func newDynsecretIntegrationDB(t *testing.T, ctx context.Context) (*pgxpool.Pool, func()) {
 	t.Helper()
@@ -164,7 +182,7 @@ func TestSweeperDropsPostgresRole(t *testing.T) {
 	defer cleanup()
 	userID, projectID := seedSweepProjectChain(t, ctx, pool)
 
-	masterKey := []byte("0123456789abcdef0123456789abcdef")
+	masterKey := newSweepMasterKey(t)
 	// The test database itself is the backend: same instance, same pg_roles.
 	providerID := seedSweepProvider(t, ctx, pool, masterKey, userID, projectID, "postgres", map[string]string{
 		"host": "localhost", "port": "15432", "database": "postgres",
@@ -215,12 +233,12 @@ func TestSweeperMarksDerivedLeases(t *testing.T) {
 	defer cleanup()
 	userID, projectID := seedSweepProjectChain(t, ctx, pool)
 
-	masterKey := []byte("0123456789abcdef0123456789abcdef")
+	masterKey := newSweepMasterKey(t)
 	providerID := seedSweepProvider(t, ctx, pool, masterKey, userID, projectID, "derived_api_key", map[string]string{
-		"master_key": "sk-x", "upstream": "api.example.com",
+		"master_key": newSweepDerivedMaster(t), "upstream": "api.example.com",
 	})
 	leaseID := seedSweepLease(t, ctx, pool, masterKey, providerID,
-		map[string]string{"api_key": "valt_dk_test"}, time.Now().Add(-10*time.Minute))
+		map[string]string{"api_key": DerivedKeyPrefix + "test"}, time.Now().Add(-10*time.Minute))
 
 	svc := NewService(pool, masterKey)
 	swept, err := svc.SweepExpiredBackends(ctx)
@@ -239,13 +257,13 @@ func TestSweeperRespectsGrace(t *testing.T) {
 	defer cleanup()
 	userID, projectID := seedSweepProjectChain(t, ctx, pool)
 
-	masterKey := []byte("0123456789abcdef0123456789abcdef")
+	masterKey := newSweepMasterKey(t)
 	providerID := seedSweepProvider(t, ctx, pool, masterKey, userID, projectID, "derived_api_key", map[string]string{
-		"master_key": "sk-x",
+		"master_key": newSweepDerivedMaster(t),
 	})
 	// Expired 1 minute ago — within the 5-minute sweep grace.
 	leaseID := seedSweepLease(t, ctx, pool, masterKey, providerID,
-		map[string]string{"api_key": "valt_dk_fresh"}, time.Now().Add(-1*time.Minute))
+		map[string]string{"api_key": DerivedKeyPrefix + "fresh"}, time.Now().Add(-1*time.Minute))
 
 	svc := NewService(pool, masterKey)
 	swept, err := svc.SweepExpiredBackends(ctx)

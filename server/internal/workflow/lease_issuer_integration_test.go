@@ -2,6 +2,8 @@ package workflow
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
@@ -17,13 +19,33 @@ import (
 const (
 	leaseAgentID  = "00000000-0000-0000-0000-000000000601"
 	leaseProvider = "00000000-0000-0000-0000-000000000602"
-	testMasterKey = "0123456789abcdef0123456789abcdef"
 )
+
+// newTestMasterKey generates a fresh AES-256 key per test run — integration
+// tests must not embed key material as source literals.
+func newTestMasterKey(t *testing.T) []byte {
+	t.Helper()
+	k := make([]byte, 32)
+	if _, err := cryptorand.Read(k); err != nil {
+		t.Fatalf("generate master key: %v", err)
+	}
+	return k
+}
+
+// newTestMasterKeyString is the string form for derived_api_key provider configs.
+func newTestMasterKeyString(t *testing.T) string {
+	t.Helper()
+	raw := make([]byte, 24)
+	if _, err := cryptorand.Read(raw); err != nil {
+		t.Fatalf("generate master key: %v", err)
+	}
+	return "sk-" + hex.EncodeToString(raw)
+}
 
 // seedLeaseE2EData seeds an agent identity and a derived_api_key provider,
 // then links the existing project secret (from seedWorkflowPolicyData) to it.
-// Returns the linked vault secret as seen by the approval path.
-func seedLeaseE2EData(t *testing.T, ctx context.Context, pool *pgxpool.Pool, dynSvc *dynsecret.Service) *vault.Secret {
+// Returns the linked vault secret and the generated provider master key.
+func seedLeaseE2EData(t *testing.T, ctx context.Context, pool *pgxpool.Pool, dynSvc *dynsecret.Service) (*vault.Secret, string) {
 	t.Helper()
 
 	_, err := pool.Exec(ctx, `
@@ -34,8 +56,9 @@ func seedLeaseE2EData(t *testing.T, ctx context.Context, pool *pgxpool.Pool, dyn
 		t.Fatalf("seed agent identity: %v", err)
 	}
 
+	masterKey := newTestMasterKeyString(t)
 	pc, err := dynSvc.CreateProvider(ctx, projectID, "ai-provider", "derived_api_key",
-		map[string]string{"master_key": "sk-company-ai-master", "upstream": "api.openai.com"}, ownerID)
+		map[string]string{"master_key": masterKey, "upstream": "api.openai.com"}, ownerID)
 	if err != nil {
 		t.Fatalf("create provider: %v", err)
 	}
@@ -52,7 +75,7 @@ func seedLeaseE2EData(t *testing.T, ctx context.Context, pool *pgxpool.Pool, dyn
 	if secret.DynamicProviderID == nil || *secret.DynamicProviderID != pc.ID {
 		t.Fatalf("secret must carry the provider link, got %v", secret.DynamicProviderID)
 	}
-	return secret
+	return secret, masterKey
 }
 
 func newLeaseE2EStack(t *testing.T, ctx context.Context) (*pgxpool.Pool, *dynsecret.Service, *CredentialManager, *LeaseIssuer, func()) {
@@ -60,7 +83,7 @@ func newLeaseE2EStack(t *testing.T, ctx context.Context) (*pgxpool.Pool, *dynsec
 	pool, cleanup := newWorkflowIntegrationDB(t, ctx)
 	database.EnsurePartitions(ctx, pool)
 
-	dynSvc := dynsecret.NewService(pool, []byte(testMasterKey))
+	dynSvc := dynsecret.NewService(pool, newTestMasterKey(t))
 	credMgr := NewCredentialManager(pool, dynSvc)
 	issuer := NewLeaseIssuer(credMgr, dynSvc, audit.NewLogger(pool))
 	return pool, dynSvc, credMgr, issuer, cleanup
@@ -73,7 +96,7 @@ func TestLeaseIssuerEndToEnd(t *testing.T) {
 	pool, dynSvc, credMgr, issuer, cleanup := newLeaseE2EStack(t, ctx)
 	defer cleanup()
 	seedWorkflowPolicyData(t, ctx, pool)
-	secret := seedLeaseE2EData(t, ctx, pool, dynSvc)
+	secret, providerMaster := seedLeaseE2EData(t, ctx, pool, dynSvc)
 
 	wfSvc := NewService(pool, false)
 
@@ -123,7 +146,7 @@ func TestLeaseIssuerEndToEnd(t *testing.T) {
 	if !ok || !strings.HasPrefix(apiKey, dynsecret.DerivedKeyPrefix) {
 		t.Fatalf("lease must carry a derived api_key, got %v", creds)
 	}
-	if strings.Contains(apiKey, "sk-company-ai-master") {
+	if strings.Contains(apiKey, providerMaster) {
 		t.Fatal("master key must never leave the vault through a lease")
 	}
 
@@ -159,7 +182,7 @@ func TestLeaseIssuerExplicitApproval(t *testing.T) {
 	pool, dynSvc, _, issuer, cleanup := newLeaseE2EStack(t, ctx)
 	defer cleanup()
 	seedWorkflowPolicyData(t, ctx, pool)
-	secret := seedLeaseE2EData(t, ctx, pool, dynSvc)
+	secret, _ := seedLeaseE2EData(t, ctx, pool, dynSvc)
 
 	wfSvc := NewService(pool, false)
 	created, err := wfSvc.CreateRequest(ctx, CreateRequestInput{
@@ -210,7 +233,7 @@ func TestLeaseIssuerTTLCap(t *testing.T) {
 	pool, dynSvc, _, issuer, cleanup := newLeaseE2EStack(t, ctx)
 	defer cleanup()
 	seedWorkflowPolicyData(t, ctx, pool)
-	secret := seedLeaseE2EData(t, ctx, pool, dynSvc)
+	secret, _ := seedLeaseE2EData(t, ctx, pool, dynSvc)
 
 	wfSvc := NewService(pool, false)
 	created, err := wfSvc.CreateRequest(ctx, CreateRequestInput{

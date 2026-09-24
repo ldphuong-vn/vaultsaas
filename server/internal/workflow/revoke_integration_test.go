@@ -69,7 +69,7 @@ func seedRevokeAllData(t *testing.T, ctx context.Context, pool *pgxpool.Pool, dy
 
 	// Derived provider linked to the project secret.
 	pc, err := dynSvc.CreateProvider(ctx, projectID, "revoke-provider", "derived_api_key",
-		map[string]string{"master_key": "sk-company-revoke-master"}, ownerID)
+		map[string]string{"master_key": newTestMasterKeyString(t)}, ownerID)
 	if err != nil {
 		t.Fatalf("create provider: %v", err)
 	}
@@ -225,7 +225,7 @@ func assertLeaseAlive(t *testing.T, ctx context.Context, dynSvc *dynsecret.Servi
 // POST /users/{user_id}/revoke-all: admin or self may call it, others may not.
 func TestRevokeAllHandlerAuthz(t *testing.T) {
 	ctx := context.Background()
-	pool, _, _, _, cleanup := newLeaseE2EStack(t, ctx)
+	pool, dynSvc, _, _, cleanup := newLeaseE2EStack(t, ctx)
 	defer cleanup()
 	seedWorkflowPolicyData(t, ctx, pool)
 
@@ -236,7 +236,7 @@ func TestRevokeAllHandlerAuthz(t *testing.T) {
 		t.Fatalf("seed admin: %v", err)
 	}
 
-	revokeSvc := NewRevokeService(pool, dynsecret.NewService(pool, []byte(testMasterKey)), nil, nil)
+	revokeSvc := NewRevokeService(pool, dynSvc, nil, nil)
 	r := chi.NewRouter()
 	r.Post("/api/v1/users/{user_id}/revoke-all", revokeSvc.HandleRevokeAllForUser)
 
